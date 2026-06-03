@@ -378,16 +378,87 @@ def apply_flow_value_mapping(
     return df_mapped
 
 
+def detect_screening_flows(df: pd.DataFrame) -> List[Dict]:
+    """
+    Automatically detect screening/filter flows from the data.
+    
+    A screening flow is a column where respondents choose between options
+    that lead to different paths (e.g., "Are you a voter?" → Ya/Tidak).
+    
+    Detection heuristics:
+    1. Find columns with FlowNo values
+    2. Check if one value has significantly fewer responses than others
+    3. Check if respondents with that value have many empty columns
+       (indicating they were redirected away from the main survey)
+    
+    Returns:
+        List of dicts with keys:
+        - 'col': column name
+        - 'skip_value': the FlowNo value that triggers skip (e.g., 'FlowNo_2=2')
+        - 'skip_label': description (e.g., 'Flow 2, Option 2')
+        - 'main_count': number of main respondents
+        - 'skip_count': number of skipped respondents
+    """
+    flow_pattern = re.compile(r'^FlowNo_(\d+)=(\d+)$')
+    screening_flows = []
+    
+    for col in df.columns:
+        if col == 'phonenum':
+            continue
+        
+        col_str = df[col].astype(str).str.strip()
+        
+        # Find all unique FlowNo values in this column
+        flowno_values = [v for v in col_str.unique() if flow_pattern.match(str(v))]
+        
+        if len(flowno_values) < 2:
+            continue
+        
+        # For each FlowNo value, check if respondents with that value
+        # have significantly more empty columns (indicating skip/redirect)
+        total_cols = len([c for c in df.columns if c != 'phonenum'])
+        
+        for flowno_val in flowno_values:
+            mask = col_str == flowno_val
+            respondent_group = df[mask]
+            
+            if len(respondent_group) == 0:
+                continue
+            
+            # Calculate null ratio for this group
+            question_cols = [c for c in df.columns if c != 'phonenum']
+            null_ratio = respondent_group[question_cols].isnull().mean().mean()
+            
+            # Calculate null ratio for ALL respondents
+            overall_null_ratio = df[question_cols].isnull().mean().mean()
+            
+            # If this group has significantly higher null ratio (>30% higher than overall),
+            # they're likely the "skip" group
+            if null_ratio > overall_null_ratio + 0.3:
+                # Also check: this group should have fewer respondents
+                if len(respondent_group) < len(df) * 0.5:
+                    screening_flows.append({
+                        'col': col,
+                        'skip_value': flowno_val,
+                        'main_count': len(df) - len(respondent_group),
+                        'skip_count': len(respondent_group),
+                    })
+    
+    # Sort by column index (earlier columns are more likely to be screening)
+    screening_flows.sort(key=lambda x: x['col'])
+    return screening_flows
+
+
 def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Handle IVR skip logic by splitting data into:
-    - main_df: respondents who did NOT choose the skip option (e.g., FlowNo_2=1)
-    - skipped_df: respondents who were redirected (e.g., FlowNo_2=2 → jump to final questions)
-
+    - main_df: respondents who did NOT choose the skip option
+    - skipped_df: respondents who were redirected
+    
     Args:
         df: DataFrame with FlowNo values (before or after mapping)
         skip_flow_no: The FlowNo value that triggers the skip/redirect
-
+    
     Returns:
         Tuple of (main_df, skipped_df)
     """
@@ -398,14 +469,12 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
     for col in df.columns:
         if col == 'phonenum':
             continue
-        # Normalize: convert to string, strip whitespace
         col_values = df[col].astype(str).str.strip()
         if (col_values == skip_flow_no).any():
             skip_col = col
             break
 
     if skip_col is None:
-        # No skip logic found, return all data as main
         return df, pd.DataFrame()
 
     # Split: rows where skip_col == skip_flow_no are the "skipped" respondents
@@ -417,16 +486,64 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
     return main_df, skipped_df
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def auto_filter_screening(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict]]:
     """
-    Clean IVR data:
+    Automatically detect and apply screening flow filtering.
+    
+    Tries multiple approaches:
+    1. Auto-detect screening flows from data patterns
+    2. Fall back to checking for common FlowNo_2=2 pattern
+    
+    Args:
+        df: DataFrame with FlowNo values
+    
+    Returns:
+        Tuple of (main_df, skipped_df, detected_flows)
+    """
+    # Try auto-detection
+    detected = detect_screening_flows(df)
+    
+    if detected:
+        # Use the first detected screening flow (most common case)
+        screening = detected[0]
+        main_df, skipped_df = filter_skip_logic(df, screening['skip_value'])
+        return main_df, skipped_df, detected
+    
+    # Fallback: try common patterns
+    common_patterns = [
+        ("FlowNo_2=2", "Flow 2, Option 2 (Tidak)"),
+        ("FlowNo_2=1", "Flow 2, Option 1 (Ya)"),
+    ]
+    
+    for pattern, _ in common_patterns:
+        main_df, skipped_df = filter_skip_logic(df, pattern)
+        if not skipped_df.empty and len(skipped_df) < len(df):
+            return main_df, skipped_df, [{'col': 'auto', 'skip_value': pattern, 
+                                           'main_count': len(main_df), 'skip_count': len(skipped_df)}]
+    
+    # No screening detected
+    return df, pd.DataFrame(), []
+
+
+def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.DataFrame:
+    """
+    Clean IVR data for branching/multi-level IVR surveys:
     1. Thoroughly convert all null-like values to actual np.nan
-    2. Drop rows where ANY active question column is NaN (incomplete)
-    3. Remove duplicate phone numbers (keep first occurrence)
-    4. Add Mode column
+    2. Identify branch-specific columns (mutually exclusive flows)
+    3. Drop rows with too many NaN answers (using only common columns)
+    4. Remove duplicate phone numbers (keep first occurrence)
+    5. Add Mode column
+
+    Branch-specific columns are automatically identified: columns with
+    30-70% null values are likely mutually exclusive branches (e.g.,
+    Flow 9 vs Flow 10 in Johor IVR). These are excluded from the
+    completeness check so respondents aren't penalized for taking a
+    different branch.
 
     Args:
         df: DataFrame to clean
+        completeness_threshold: 0.0-1.0, minimum fraction of COMMON cols
+                               that must be non-null (default 0.8)
 
     Returns:
         Cleaned DataFrame
@@ -434,7 +551,6 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df_clean = df.copy()
 
     # Step 1: Thoroughly replace null-like values with np.nan
-    # Apply cell-by-cell to catch ALL variants
     null_like = {'', ' ', '  ', 'nan', 'NaN', 'NAN', 'None', 'none', 'NONE',
                  'null', 'NULL', 'NaT', 'nat', 'N/A', 'n/a', 'NA', 'na',
                  'undefined', 'Nan', '<NA>'}
@@ -450,19 +566,36 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     # Step 2: Identify question columns (all except phonenum and Mode)
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
 
-    # Find "active" columns: columns with at least one non-null value
-    # This excludes columns that are entirely NaN (e.g., skip logic branches)
-    active_cols = [col for col in question_cols if df_clean[col].notna().any()]
+    # Step 3: Classify columns into "common" vs "branch-specific"
+    # - Columns with <10% null = common (almost all respondents answered)
+    # - Columns with 10-95% null = likely branch-specific (mutually exclusive flows)
+    #   These are EXCLUDED from the completeness check so respondents aren't
+    #   penalized for taking a different branch path
+    # - Columns with >95% null = likely entirely-NaN for this group (skip logic)
+    common_cols = []
+    branch_cols = []
 
-    # Drop rows where ALL active columns are null (respondent answered nothing)
-    if active_cols:
-        df_clean = df_clean.dropna(subset=active_cols, how='all')
+    for col in question_cols:
+        null_pct = df_clean[col].isnull().mean()
+        if null_pct < 0.10:
+            common_cols.append(col)
+        elif null_pct < 0.95:
+            branch_cols.append(col)
+        # Columns with >95% null are ignored (not in common or branch)
 
-    # Drop rows where ANY active column is NaN (incomplete responses)
-    if active_cols:
-        df_clean = df_clean.dropna(subset=active_cols, how='any')
+    # Step 4: Drop rows where ALL columns are null (answered nothing)
+    all_active = common_cols + branch_cols
+    if all_active:
+        df_clean = df_clean.dropna(subset=all_active, how='all')
 
-    # Step 3: Remove duplicate phone numbers (keep first occurrence)
+    # Step 5: Drop rows below completeness threshold on COMMON columns only
+    # Branch-specific columns are excluded from the check
+    if common_cols:
+        non_null_counts = df_clean[common_cols].notna().sum(axis=1)
+        completeness = non_null_counts / len(common_cols)
+        df_clean = df_clean[completeness >= completeness_threshold]
+
+    # Step 6: Remove duplicate phone numbers (keep first occurrence)
     if 'phonenum' in df_clean.columns:
         before_count = len(df_clean)
         df_clean = df_clean.drop_duplicates(subset='phonenum', keep='first')
@@ -470,7 +603,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         if dupes_removed > 0:
             print(f"Removed {dupes_removed} duplicate phone numbers")
 
-    # Step 4: Add Mode column
+    # Step 7: Add Mode column
     df_clean['Mode'] = 'IVR'
 
     return df_clean

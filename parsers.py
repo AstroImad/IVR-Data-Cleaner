@@ -4,7 +4,7 @@ Parses IVR script documents (PDF/DOCX) to extract:
 - Answer choices (mapped to FlowNo_X=Y patterns)
 
 Handles multi-layer/branching IVR scripts where:
-- "Tekan X untuk Y Call flow N" indicates a redirect (not a regular answer)
+- "Tekan X untuk Y Call flow N" indicates an answer that redirects to another flow
 - "Tekan N hingga M" is a range description for multi-item sub-questions
 - Duplicate question texts are disambiguated by appending the flow number
 """
@@ -45,11 +45,6 @@ def clean_flow_line(text: str) -> str:
 def _disambiguate_questions(flow_to_question: Dict[int, str]) -> Dict[int, str]:
     """
     Ensure all question texts are unique by appending flow number to duplicates.
-    E.g., if "Sila pilih negeri anda:" appears for flows 28, 29, 30, 31, 32,
-    they become:
-        "Sila pilih negeri anda: (Flow 28)"
-        "Sila pilih negeri anda: (Flow 29)"
-        etc.
     """
     from collections import Counter
     q_counts = Counter(flow_to_question.values())
@@ -74,11 +69,14 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     """
     Parse an IVR script document to extract questions and answer mappings.
 
-    Handles multi-layer/branching IVR scripts where:
-    - "Tekan X untuk Y Call flow N" indicates a redirect (not a regular answer)
-    - "Tekan 1 hingga 3" is a range description in question text, not an answer
-    - Multi-item sub-questions (e.g., "Bomba tekan 1 hingga 3 Call flow 5")
-    - Duplicate question texts are disambiguated by appending flow number
+    Key insight: In multi-layer IVR, "Call flow N" appears both:
+    1. As section boundary markers (after question text)
+    2. As routing info embedded inside answer lines ("Tekan X untuk Y Call flow M")
+
+    The parser handles this by:
+    - Pre-processing: temporarily removing "Call flow M" from inside "Tekan" lines
+    - Then splitting on the remaining standalone "Call flow N" markers
+    - Answers from "Tekan X untuk Y Call flow M" lines still capture the answer text
 
     Args:
         file_bytes: Raw bytes of the uploaded file
@@ -100,22 +98,22 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     text = clean_flow_line(text)
 
     # ── Regex patterns ───────────────────────────────────────────────────
-    call_flow_pattern = re.compile(r'Call\s+flow\s+(\d+)', re.IGNORECASE)
-
-    # "Tekan N untuk X" - standard answer format (must start the line)
-    tekan_untuk_pattern = re.compile(r'^\s*Tekan\s+(\d+)\s+untuk\s+(.+)', re.IGNORECASE | re.MULTILINE)
-
-    # "Tekan N untuk X Call flow M" - redirect format (branching, must start the line)
+    # "Tekan N untuk X Call flow M" - answer with redirect routing
     tekan_redirect_pattern = re.compile(
-        r'^\s*Tekan\s+(\d+)\s+untuk\s+(.+?)\s+Call\s+flow\s+\d+',
-        re.IGNORECASE | re.MULTILINE
+        r'(Tekan\s+\d+\s+untuk\s+.+?)\s+Call\s+flow\s+\d+',
+        re.IGNORECASE
+    )
+
+    # "Tekan N untuk X" - standard answer (no redirect)
+    tekan_untuk_pattern = re.compile(
+        r'Tekan\s+(\d+)\s+untuk\s+(.+)',
+        re.IGNORECASE
     )
 
     # "Tekan N hingga M" - range description in question text (NOT an answer)
     tekan_range_pattern = re.compile(r'Tekan\s+\d+\s+hingga\s+\d+', re.IGNORECASE)
 
     # Multi-item pattern: "Entity Name tekan N hingga M Call flow X"
-    # This appears in sub-questions like "Bomba tekan 1 hingga 3 Call flow 5"
     multi_item_pattern = re.compile(
         r'(.+?)\s+tekan\s+(\d+)\s+hingga\s+(\d+)\s+Call\s+flow\s+(\d+)',
         re.IGNORECASE
@@ -124,46 +122,73 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     # Skip patterns for greeting/intro lines
     skip_patterns = [
         'salam sejahtera', 'terima kasih', 'kajian bebas', 'cpi',
-        'hanya merangkumi', 'soalan untuk bukan pengundi'
+        'hanya merangkumi', 'soalan untuk bukan pengundi',
+        'berdasarkan', 'q3,q4', 'q6 jawab', 'q2'
     ]
 
-    # ── First pass: detect multi-item sub-questions ──────────────────────
-    # Multi-item patterns like "Bomba tekan 1 hingga 3 Call flow 5"
-    # These are entity names with their own flow numbers.
-    multi_item_questions: Dict[int, str] = {}  # flow_num -> entity_name
-    multi_item_flows: set = set()
+    # ── Pre-process: Handle "Tekan N untuk X Call flow M" lines ─────────
+    # These are answers WITH routing, not section boundaries.
+    # Strategy: replace "Call flow M" in these lines with a placeholder
+    # so they don't get treated as section boundaries.
 
-    for match in multi_item_pattern.finditer(text):
+    # Store redirect answers separately
+    redirect_answers: Dict[str, str] = {}  # FlowNo_X=Y -> answer text
+
+    def replace_redirect(match):
+        """Replace 'Call flow M' in Tekan lines with a placeholder."""
+        tekan_text = match.group(1)  # "Tekan N untuk X"
+        tekan_match = tekan_untuk_pattern.search(tekan_text)
+        if tekan_match:
+            return tekan_text  # Remove "Call flow M" part
+        return match.group(0)
+
+    # Find all redirect lines and extract answers before modifying text
+    for m in tekan_redirect_pattern.finditer(text):
+        full_line = m.group(0)
+        tekan_match = tekan_untuk_pattern.search(full_line)
+        if tekan_match:
+            choice_num = int(tekan_match.group(1))
+            answer_text = tekan_match.group(2).strip()
+            # Remove trailing "Call flow M" from answer text
+            answer_text = re.sub(r'\s*Call\s+flow\s+\d+\s*$', '', answer_text, flags=re.IGNORECASE).strip()
+            # We don't know the flow number yet, store temporarily
+            # Will be assigned during section processing
+
+    # Now replace "Call flow M" inside Tekan lines with empty string
+    processed_text = tekan_redirect_pattern.sub(replace_redirect, text)
+
+    # ── First pass: detect multi-item sub-questions ──────────────────────
+    multi_item_questions: Dict[int, str] = {}
+
+    for match in multi_item_pattern.finditer(processed_text):
         entity_name = match.group(1).strip()
         flow_num = int(match.group(4))
         multi_item_questions[flow_num] = entity_name
-        multi_item_flows.add(flow_num)
 
-    # ── Second pass: find all "Call flow N" and extract questions/answers ─
-    cf_matches = list(call_flow_pattern.finditer(text))
+    # ── Second pass: split by standalone "Call flow N" and process ──────
+    call_flow_pattern = re.compile(r'Call\s+flow\s+(\d+)', re.IGNORECASE)
+    cf_matches = list(call_flow_pattern.finditer(processed_text))
 
     flow_to_question: Dict[int, str] = {}
     flow_value_mapping: Dict[str, str] = {}
 
     for idx, cf_match in enumerate(cf_matches):
         flow_num = int(cf_match.group(1))
-        cf_start = cf_match.start()
         cf_end = cf_match.end()
 
         # Content BEFORE this "Call flow N" (from previous flow's end)
         if idx > 0:
-            content_before = text[cf_matches[idx - 1].end():cf_start]
+            content_before = processed_text[cf_matches[idx - 1].end():cf_match.start()]
         else:
-            content_before = text[:cf_start]
+            content_before = processed_text[:cf_match.start()]
 
         # Content AFTER this "Call flow N" (until next "Call flow N")
         if idx + 1 < len(cf_matches):
-            content_after = text[cf_end:cf_matches[idx + 1].start()]
+            content_after = processed_text[cf_end:cf_matches[idx + 1].start()]
         else:
-            content_after = text[cf_end:]
+            content_after = processed_text[cf_end:]
 
         # ── Extract question text ──────────────────────────────────────
-        # Check if this is a multi-item flow
         if flow_num in multi_item_questions:
             question_text = multi_item_questions[flow_num]
         else:
@@ -171,10 +196,6 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
                 content_before, content_after,
                 tekan_untuk_pattern, tekan_range_pattern, skip_patterns
             )
-            if question_text:
-                question_text = _clean_question_text(
-                    question_text, tekan_redirect_pattern
-                )
 
         if question_text and flow_num >= 2:
             flow_to_question[flow_num] = question_text
@@ -182,7 +203,7 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
         # ── Extract answer mappings from content_after ─────────────────
         _extract_answers_from_content(
             content_after, flow_num,
-            tekan_untuk_pattern, tekan_redirect_pattern, tekan_range_pattern,
+            tekan_untuk_pattern, tekan_range_pattern,
             flow_value_mapping
         )
 
@@ -213,15 +234,15 @@ def _extract_question_from_content(
         if any(skip in line_stripped.lower() for skip in skip_patterns):
             continue
 
-        # Skip "Tekan N untuk X" lines (these are answers for the PREVIOUS flow)
+        # Skip "Tekan N untuk X" lines (answers for the PREVIOUS flow)
         if tekan_untuk_pattern.search(line_stripped):
             continue
 
-        # Skip "Tekan N hingga M" lines (range descriptions for multi-item sub-questions)
+        # Skip "Tekan N hingga M" lines (range descriptions)
         if tekan_range_pattern.search(line_stripped):
             continue
 
-        # Clean stray characters from line starts (e.g., "]Sila pilih negeri anda:")
+        # Clean stray characters from line starts
         line_stripped = re.sub(r'^[\]\[\)\(}{\s]+', '', line_stripped).strip()
         if not line_stripped:
             continue
@@ -264,7 +285,6 @@ def _extract_answers_from_content(
     content_after: str,
     flow_num: int,
     tekan_untuk_pattern,
-    tekan_redirect_pattern,
     tekan_range_pattern,
     flow_value_mapping: Dict[str, str]
 ):
@@ -276,29 +296,24 @@ def _extract_answers_from_content(
         if not line_stripped:
             continue
 
-        # Check for "Tekan N untuk X Call flow M" (REDIRECT - not a real answer)
-        if tekan_redirect_pattern.search(line_stripped):
-            continue
-
         # Check for "Tekan N hingga M" (range description - not an answer)
         if tekan_range_pattern.search(line_stripped):
             continue
 
-        # Check for "Tekan N untuk X" (regular answer)
+        # Check for "Tekan N untuk X" (answer - may or may not have redirect)
         tekan_match = tekan_untuk_pattern.search(line_stripped)
         if tekan_match:
             choice_num = int(tekan_match.group(1))
             answer_text = tekan_match.group(2).strip()
+            # Remove any trailing "Call flow M" that might remain
+            answer_text = re.sub(r'\s*Call\s+flow\s+\d+\s*$', '', answer_text, flags=re.IGNORECASE).strip()
             key = f"FlowNo_{flow_num}={choice_num}"
             flow_value_mapping[key] = answer_text
 
 
 def _clean_question_text(text: str, tekan_redirect_pattern) -> str:
     """
-    Clean question text by removing embedded "Tekan N untuk X" redirect patterns
-    that appear on the same line as the question.
-
-    Preserves "Tekan N hingga M" range descriptions.
+    Clean question text by removing embedded "Tekan N untuk X" redirect patterns.
     """
     lines = text.split('\n')
     cleaned_lines = []
@@ -308,17 +323,7 @@ def _clean_question_text(text: str, tekan_redirect_pattern) -> str:
         if not line:
             continue
 
-        # If this line has a redirect "Tekan N untuk X Call flow M",
-        # extract the part before the Tekan pattern
-        redirect_match = tekan_redirect_pattern.search(line)
-        if redirect_match:
-            before_tekan = line[:redirect_match.start()].strip()
-            if before_tekan:
-                cleaned_lines.append(before_tekan)
-            continue
-
-        # If this line has a "Tekan N untuk X" (without "Call flow"),
-        # it's an answer line that got mixed into the question. Extract the question part.
+        # If this line has a "Tekan N untuk X" pattern, extract the part before it
         tekan_match = re.search(r'Tekan\s+\d+\s+untuk\s+', line, re.IGNORECASE)
         if tekan_match:
             before_tekan = line[:tekan_match.start()].strip()
@@ -326,7 +331,6 @@ def _clean_question_text(text: str, tekan_redirect_pattern) -> str:
                 cleaned_lines.append(before_tekan)
             continue
 
-        # Keep the line as-is (includes "Tekan N hingga M" range descriptions)
         cleaned_lines.append(line)
 
     return " ".join(cleaned_lines).strip()

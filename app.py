@@ -22,6 +22,8 @@ from cleaning import (
     apply_column_renames,
     apply_flow_value_mapping,
     filter_skip_logic,
+    auto_filter_screening,
+    detect_screening_flows,
     clean_data,
     get_data_summary,
 )
@@ -57,6 +59,8 @@ if 'cleaned_df' not in st.session_state:
     st.session_state.cleaned_df = None
 if 'skipped_df' not in st.session_state:
     st.session_state.skipped_df = None
+if 'completeness_threshold' not in st.session_state:
+    st.session_state.completeness_threshold = 0.8
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -397,18 +401,19 @@ elif st.session_state.step == 3:
     st.divider()
     st.subheader("🔀 Skip Logic Filtering")
 
-    # Detect skip on raw data where FlowNo values are still raw
-    main_df_raw, skipped_df_raw = filter_skip_logic(df, "FlowNo_2=2")
+    # Auto-detect screening flows from raw data
+    main_df_raw, skipped_df_raw, detected_flows = auto_filter_screening(df)
 
-    if not skipped_df_raw.empty:
-        st.info(
-            f"Detected skip logic: **{len(skipped_df_raw)}** respondents chose the skip option "
-            f"(FlowNo_2=2 → redirected to different questions). "
-            f"**{len(main_df_raw)}** respondents continued with the main survey."
-        )
+    if detected_flows:
+        for sf in detected_flows:
+            st.info(
+                f"🔍 Detected screening flow: **{sf['skip_value']}** — "
+                f"**{sf['skip_count']}** respondents skipped (redirected), "
+                f"**{sf['main_count']}** continued with main survey."
+            )
 
         keep_main = st.checkbox(
-            "Filter: Keep only main survey respondents (FlowNo_2=1)",
+            "Filter: Keep only main survey respondents (remove skipped)",
             value=True,
             key="skip_logic_checkbox",
             help="Uncheck to keep all respondents including those who were redirected."
@@ -416,18 +421,19 @@ elif st.session_state.step == 3:
 
         if keep_main:
             # Save skipped data for export in a separate sheet
-            skipped_renamed, _ = apply_column_renames(
-                skipped_df_raw, flow_to_question, flow_to_cols
-            )
-            skipped_mapped = apply_flow_value_mapping(skipped_renamed, flow_value_mapping)
-            st.session_state.skipped_df = skipped_mapped
+            if not skipped_df_raw.empty:
+                skipped_renamed, _ = apply_column_renames(
+                    skipped_df_raw, flow_to_question, flow_to_cols
+                )
+                skipped_mapped = apply_flow_value_mapping(skipped_renamed, flow_value_mapping)
+                st.session_state.skipped_df = skipped_mapped
             df = main_df_raw
-            st.success(f"✅ Filtering to {len(df)} main survey respondents (FlowNo_2=1). Skipped data will be in a separate Excel sheet.")
+            st.success(f"✅ Filtering to {len(df)} main survey respondents. Skipped data will be in a separate Excel sheet.")
         else:
             st.session_state.skipped_df = pd.DataFrame()
             st.info(f"Keeping all {len(df)} respondents.")
     else:
-        st.info("No skip logic detected in the data.")
+        st.info("ℹ️ No screening/skip logic auto-detected. All respondents will be included.")
 
     st.divider()
 
@@ -535,12 +541,23 @@ elif st.session_state.step == 4:
             st.session_state.step = 3
             st.rerun()
     else:
-        # Apply cleaning
-        if st.session_state.cleaned_df is None:
-            with st.spinner("Cleaning data..."):
-                st.session_state.cleaned_df = clean_data(st.session_state.mapped_df)
-        
-        df = st.session_state.cleaned_df
+        # Completeness threshold control
+        st.session_state.completeness_threshold = st.slider(
+            "Minimum data completeness threshold",
+            min_value=0.0, max_value=1.0, value=st.session_state.completeness_threshold,
+            step=0.05,
+            help="Rows must have at least this fraction of active columns filled to be kept. "
+                 "0.0 = keep all rows (only drop fully empty), 1.0 = drop any row with a missing value. "
+                 "For branching IVR surveys, try 0.5-0.7 to allow for branch-specific empty columns."
+        )
+
+        # Always recalculate with current threshold
+        with st.spinner("Cleaning data..."):
+            df = clean_data(
+                st.session_state.mapped_df,
+                completeness_threshold=st.session_state.completeness_threshold
+            )
+        st.session_state.cleaned_df = df
         
         # ─── Summary Stats ─────────────────────────────────────────────────
         st.subheader("📊 Data Summary")
