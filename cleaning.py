@@ -144,8 +144,10 @@ def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[
         keypress = df.loc[:, 'UserKeyPress':]
         raw_results = pd.concat([phonenum, keypress], axis='columns')
 
-        # Drop rows with null value in any column
-        raw_results = raw_results.dropna(axis='index', how='any')
+        # Only drop rows where ALL question columns are null (respondent didn't answer anything)
+        # Keep rows with partial answers (e.g., skip logic, early hang-up)
+        question_cols = [c for c in raw_results.columns if c != 'PhoneNo']
+        raw_results = raw_results.dropna(subset=question_cols, how='all')
 
         # Convert to string
         raw_results = raw_results.astype(str)
@@ -379,10 +381,8 @@ def apply_flow_value_mapping(
 def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Handle IVR skip logic by splitting data into:
-    - main_df: respondents who answered skip_flow_no with the "continue" option (e.g., FlowNo_2=1)
+    - main_df: respondents who did NOT choose the skip option (e.g., FlowNo_2=1)
     - skipped_df: respondents who were redirected (e.g., FlowNo_2=2 → jump to final questions)
-
-    The first FlowNo column in the data is used as the branching point.
 
     Args:
         df: DataFrame with FlowNo values (before or after mapping)
@@ -391,12 +391,16 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
     Returns:
         Tuple of (main_df, skipped_df)
     """
+    skip_flow_no = skip_flow_no.strip()
+
     # Find the column that contains the skip flow value
     skip_col = None
     for col in df.columns:
         if col == 'phonenum':
             continue
-        if skip_flow_no in df[col].values:
+        # Normalize: convert to string, strip whitespace
+        col_values = df[col].astype(str).str.strip()
+        if (col_values == skip_flow_no).any():
             skip_col = col
             break
 
@@ -405,7 +409,8 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
         return df, pd.DataFrame()
 
     # Split: rows where skip_col == skip_flow_no are the "skipped" respondents
-    skipped_mask = df[skip_col] == skip_flow_no
+    col_values = df[skip_col].astype(str).str.strip()
+    skipped_mask = col_values == skip_flow_no
     main_df = df[~skipped_mask].copy()
     skipped_df = df[skipped_mask].copy()
 
@@ -414,7 +419,13 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean IVR data: replace blanks with NaN, drop all-null rows, add Mode column.
+    Clean IVR data: replace blanks with NaN, remove rows with no data, add Mode column.
+
+    Uses lenient cleaning: only drops rows where ALL question columns are NaN
+    (respondent didn't answer anything). Keeps rows with partial answers.
+
+    Columns that are entirely NaN (e.g., skip logic branches that don't apply
+    to the current respondent group) are automatically excluded from checks.
 
     Args:
         df: DataFrame to clean
@@ -422,14 +433,19 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Cleaned DataFrame
     """
-    # Replace blank/NaN variants
+    # Replace blank/NaN string variants with actual np.nan
     df_clean = df.replace(['', ' ', 'NaN', 'nan', 'None', 'none', 'null'], np.nan)
 
-    # Identify compulsory columns (all except phonenum and Mode)
-    compulsory_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
+    # Identify question columns (all except phonenum and Mode)
+    question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
 
-    # Drop rows where all compulsory columns are null
-    df_clean = df_clean.dropna(subset=compulsory_cols, how='all')
+    # Find "active" columns: columns that have at least one non-null value
+    # This automatically skips columns that are entirely NaN (e.g., skip logic
+    # branch columns that don't apply to this respondent group)
+    active_cols = [col for col in question_cols if df_clean[col].notna().any()]
+
+    # Drop rows where ALL active columns are null (respondent didn't answer anything)
+    df_clean = df_clean.dropna(subset=active_cols, how='all')
 
     # Add Mode column
     df_clean['Mode'] = 'IVR'

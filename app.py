@@ -55,6 +55,8 @@ if 'mapped_df' not in st.session_state:
     st.session_state.mapped_df = None
 if 'cleaned_df' not in st.session_state:
     st.session_state.cleaned_df = None
+if 'skipped_df' not in st.session_state:
+    st.session_state.skipped_df = None
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -75,11 +77,13 @@ def reset_from_step(step: int):
     st.session_state.step = step
 
 
-def to_excel(df: pd.DataFrame) -> bytes:
-    """Convert DataFrame to Excel bytes for download."""
+def to_excel(main_df: pd.DataFrame, skipped_df: pd.DataFrame = None) -> bytes:
+    """Convert DataFrame(s) to Excel bytes for download with multiple sheets."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='IVR Cleaned')
+        main_df.to_excel(writer, index=False, sheet_name='Main Survey')
+        if skipped_df is not None and not skipped_df.empty:
+            skipped_df.to_excel(writer, index=False, sheet_name='Skipped (FlowNo_2=2)')
     return output.getvalue()
 
 
@@ -411,9 +415,16 @@ elif st.session_state.step == 3:
         )
 
         if keep_main:
+            # Save skipped data for export in a separate sheet
+            skipped_renamed, _ = apply_column_renames(
+                skipped_df_raw, flow_to_question, flow_to_cols
+            )
+            skipped_mapped = apply_flow_value_mapping(skipped_renamed, flow_value_mapping)
+            st.session_state.skipped_df = skipped_mapped
             df = main_df_raw
-            st.success(f"✅ Filtering to {len(df)} main survey respondents (FlowNo_2=1).")
+            st.success(f"✅ Filtering to {len(df)} main survey respondents (FlowNo_2=1). Skipped data will be in a separate Excel sheet.")
         else:
+            st.session_state.skipped_df = pd.DataFrame()
             st.info(f"Keeping all {len(df)} respondents.")
     else:
         st.info("No skip logic detected in the data.")
@@ -465,9 +476,16 @@ elif st.session_state.step == 3:
         if unmapped_values:
             st.warning(f"⚠️ Found {len(unmapped_values)} unmapped FlowNo values. You can fix them below:")
 
+            # Sort unmapped values numerically by FlowNo_X=Y
+            def _sort_flowno(val):
+                match = re.match(r'FlowNo_(\d+)=(\d+)', val)
+                if match:
+                    return (int(match.group(1)), int(match.group(2)))
+                return (999, 999)
+
             # Inline editing for unmapped values
             edited_unmapped = {}
-            for val in sorted(unmapped_values):
+            for val in sorted(unmapped_values, key=_sort_flowno):
                 col1_edit, col2_edit = st.columns([1, 2])
                 with col1_edit:
                     st.code(val)
@@ -596,7 +614,7 @@ elif st.session_state.step == 4:
         st.divider()
         st.subheader("📥 Export Data")
         
-        excel_bytes = to_excel(df)
+        excel_bytes = to_excel(df, st.session_state.skipped_df)
         
         st.download_button(
             label="📥 Download as Excel",
