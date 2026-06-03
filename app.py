@@ -381,10 +381,45 @@ elif st.session_state.step == 3:
             if fn not in flow_to_cols
         ]
         if unmatched_questions:
-            st.warning(f"⚠️ Question(s) for flow(s) {unmatched_questions} found in script but not detected in data.")
+            st.info(
+                f"ℹ️ {len(unmatched_questions)} question(s) from the script have no matching data columns "
+                f"(flows {unmatched_questions}). This is normal for IVR scripts with skip logic or "
+                f"branching paths. These will be ignored."
+            )
     
     st.divider()
     
+    # ── Skip Logic (applied on RAW data BEFORE mapping) ────────────────────
+    st.divider()
+    st.subheader("🔀 Skip Logic Filtering")
+
+    # Detect skip on raw data where FlowNo values are still raw
+    main_df_raw, skipped_df_raw = filter_skip_logic(df, "FlowNo_2=2")
+
+    if not skipped_df_raw.empty:
+        st.info(
+            f"Detected skip logic: **{len(skipped_df_raw)}** respondents chose the skip option "
+            f"(FlowNo_2=2 → redirected to different questions). "
+            f"**{len(main_df_raw)}** respondents continued with the main survey."
+        )
+
+        keep_main = st.checkbox(
+            "Filter: Keep only main survey respondents (FlowNo_2=1)",
+            value=True,
+            key="skip_logic_checkbox",
+            help="Uncheck to keep all respondents including those who were redirected."
+        )
+
+        if keep_main:
+            df = main_df_raw
+            st.success(f"✅ Filtering to {len(df)} main survey respondents (FlowNo_2=1).")
+        else:
+            st.info(f"Keeping all {len(df)} respondents.")
+    else:
+        st.info("No skip logic detected in the data.")
+
+    st.divider()
+
     # Apply transformations
     if st.button("🔄 Apply Column Renaming & Flow Mapping", type="primary"):
         with st.spinner("Applying transformations..."):
@@ -456,36 +491,6 @@ elif st.session_state.step == 3:
                 st.rerun()
         else:
             st.success("✅ All FlowNo values have been mapped to answer text!")
-
-        # ── Skip Logic ────────────────────────────────────────────────────
-        st.divider()
-        st.subheader("🔀 Skip Logic Handling")
-
-        # Detect if there's a branching flow (FlowNo_2 is typically the filter)
-        main_df, skipped_df = filter_skip_logic(st.session_state.mapped_df, "FlowNo_2=2")
-
-        if not skipped_df.empty:
-            st.info(
-                f"Detected skip logic: **{len(skipped_df)}** respondents chose the skip option "
-                f"(FlowNo_2=2) and were redirected to different questions. "
-                f"**{len(main_df)}** respondents continued with the main survey."
-            )
-
-            keep_main = st.checkbox(
-                "Keep only main survey respondents (FlowNo_2=1)",
-                value=True,
-                help="Uncheck to keep all respondents including those who were redirected."
-            )
-
-            if keep_main:
-                # Re-apply after any unmapped value fixes
-                main_df, skipped_df = filter_skip_logic(st.session_state.mapped_df, "FlowNo_2=2")
-                st.session_state.mapped_df = main_df
-                st.success(f"Keeping {len(main_df)} main survey respondents.")
-            else:
-                st.info("Keeping all respondents.")
-        else:
-            st.info("No skip logic detected (no FlowNo_2=2 values found).")
 
         st.divider()
         col1, col2 = st.columns(2)
