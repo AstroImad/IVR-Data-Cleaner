@@ -519,6 +519,7 @@ elif st.session_state.step == 3:
                 st.rerun()
         with col2:
             if st.button("➡️ Continue to Step 4: Sanity Check", type="primary"):
+                st.session_state.cleaned_df = None  # Force recalculation
                 st.session_state.step = 4
                 st.rerun()
 

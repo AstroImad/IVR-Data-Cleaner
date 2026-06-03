@@ -419,13 +419,11 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tup
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Clean IVR data: replace blanks with NaN, remove rows with no data, add Mode column.
-
-    Uses lenient cleaning: only drops rows where ALL question columns are NaN
-    (respondent didn't answer anything). Keeps rows with partial answers.
-
-    Columns that are entirely NaN (e.g., skip logic branches that don't apply
-    to the current respondent group) are automatically excluded from checks.
+    Clean IVR data:
+    1. Thoroughly convert all null-like values to actual np.nan
+    2. Drop rows where ANY active question column is NaN (incomplete)
+    3. Remove duplicate phone numbers (keep first occurrence)
+    4. Add Mode column
 
     Args:
         df: DataFrame to clean
@@ -433,21 +431,46 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         Cleaned DataFrame
     """
-    # Replace blank/NaN string variants with actual np.nan
-    df_clean = df.replace(['', ' ', 'NaN', 'nan', 'None', 'none', 'null'], np.nan)
+    df_clean = df.copy()
 
-    # Identify question columns (all except phonenum and Mode)
+    # Step 1: Thoroughly replace null-like values with np.nan
+    # Apply cell-by-cell to catch ALL variants
+    null_like = {'', ' ', '  ', 'nan', 'NaN', 'NAN', 'None', 'none', 'NONE',
+                 'null', 'NULL', 'NaT', 'nat', 'N/A', 'n/a', 'NA', 'na',
+                 'undefined', 'Nan', '<NA>'}
+
+    for col in df_clean.columns:
+        if col in ['phonenum']:
+            continue
+        df_clean[col] = df_clean[col].apply(
+            lambda x: np.nan if (isinstance(x, str) and x.strip() in null_like) or
+                      (isinstance(x, str) and x.strip() == '') else x
+        )
+
+    # Step 2: Identify question columns (all except phonenum and Mode)
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
 
-    # Find "active" columns: columns that have at least one non-null value
-    # This automatically skips columns that are entirely NaN (e.g., skip logic
-    # branch columns that don't apply to this respondent group)
+    # Find "active" columns: columns with at least one non-null value
+    # This excludes columns that are entirely NaN (e.g., skip logic branches)
     active_cols = [col for col in question_cols if df_clean[col].notna().any()]
 
-    # Drop rows where ALL active columns are null (respondent didn't answer anything)
-    df_clean = df_clean.dropna(subset=active_cols, how='all')
+    # Drop rows where ALL active columns are null (respondent answered nothing)
+    if active_cols:
+        df_clean = df_clean.dropna(subset=active_cols, how='all')
 
-    # Add Mode column
+    # Drop rows where ANY active column is NaN (incomplete responses)
+    if active_cols:
+        df_clean = df_clean.dropna(subset=active_cols, how='any')
+
+    # Step 3: Remove duplicate phone numbers (keep first occurrence)
+    if 'phonenum' in df_clean.columns:
+        before_count = len(df_clean)
+        df_clean = df_clean.drop_duplicates(subset='phonenum', keep='first')
+        dupes_removed = before_count - len(df_clean)
+        if dupes_removed > 0:
+            print(f"Removed {dupes_removed} duplicate phone numbers")
+
+    # Step 4: Add Mode column
     df_clean['Mode'] = 'IVR'
 
     return df_clean
