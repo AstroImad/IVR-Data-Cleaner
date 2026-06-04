@@ -60,7 +60,7 @@ if 'cleaned_df' not in st.session_state:
 if 'skipped_df' not in st.session_state:
     st.session_state.skipped_df = None
 if 'completeness_threshold' not in st.session_state:
-    st.session_state.completeness_threshold = 0.8
+    st.session_state.completeness_threshold = 1.0
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 

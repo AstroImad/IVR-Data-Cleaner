@@ -665,7 +665,15 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
             return x
         df_clean[col] = df_clean[col].apply(_to_nan)
 
-    # Step 4: Separate out columns that are entirely NaN (>95% null)
+    # Step 4: Find the "last question" column - the most reliable completion indicator.
+    last_q_col = None
+    for col in question_cols:
+        col_lower = str(col).lower()
+        if 'terakhir' in col_lower or 'last' in col_lower:
+            last_q_col = col
+            break
+
+    # Step 5: Separate out columns that are entirely NaN (>95% null)
     # These are skip-logic branches that don't apply to this group
     active_cols = []
     for col in question_cols:
@@ -673,14 +681,41 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
         if null_pct < 0.95:
             active_cols.append(col)
 
-    # Step 5: Drop rows where ALL active columns are null (answered nothing)
-    if active_cols:
-        df_clean = df_clean.dropna(subset=active_cols, how='all')
+    # Step 6: Drop incomplete responses.
+    # Strategy: If "Soalan terakhir" column exists, use it as completion indicator.
+    # Otherwise fall back to threshold-based cleaning on active columns.
+    #
+    # IMPORTANT: Respondents who answered "Lain-lain" (Others) were redirected
+    # to the end early (e.g., "Lain-lain" -> Call flow 24 = End). These are
+    # VALID responses even though they skipped later questions.
+    # We keep them by requiring at least 2 non-null answers (screening + at least
+    # one real answer) rather than requiring ALL questions to be answered.
+    if last_q_col:
+        # Primary strategy: keep only respondents who answered the last question.
+        # "Soalan terakhir" is the most reliable completion indicator.
+        # If the IVR redirected them to the end early (e.g., "Lain-lain"),
+        # the last question column may be NaN for valid redirect paths.
+        # For those, fall back to threshold-based cleaning.
+        has_last_q = df_clean[last_q_col].notna()
 
-    # Step 6: Drop rows below completeness threshold on ALL active columns.
-    # This removes incomplete respondents who only answered a few questions
-    # and then hung up or were disconnected.
-    if active_cols:
+        # For respondents who didn't answer the last question,
+        # keep them only if they have enough non-null answers
+        # (meaningful engagement before redirect/hang-up)
+        if active_cols:
+            non_null_counts = df_clean[active_cols].notna().sum(axis=1)
+            # Use the threshold as the minimum fraction of active columns answered
+            completeness = non_null_counts / len(active_cols)
+            keep_mask = has_last_q | (completeness >= completeness_threshold)
+        else:
+            keep_mask = has_last_q
+
+        before_count = len(df_clean)
+        df_clean = df_clean[keep_mask]
+        dropped = before_count - len(df_clean)
+        if dropped > 0:
+            print(f"Dropped {dropped} incomplete responses")
+    elif active_cols:
+        # Fallback: no "last question" column - use threshold
         non_null_counts = df_clean[active_cols].notna().sum(axis=1)
         completeness = non_null_counts / len(active_cols)
         df_clean = df_clean[completeness >= completeness_threshold]
