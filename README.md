@@ -4,7 +4,7 @@ A Streamlit web application that cleans and processes Interactive Voice Response
 
 ## Features
 
-- **Multiple data input methods**: Upload ZIP file, individual CSVs, or paste Google Drive links
+- **Multiple data input methods**: Upload ZIP file or individual CSV files
 - **Script parsing**: Automatically extracts questions and answer mappings from PDF/DOCX IVR scripts
 - **Multi-layer branching support**: Handles complex IVR flows with skip logic, redirects, and mutually exclusive paths
 - **Column merging**: Automatically merges columns with the same core question (e.g., "Di parlimen manakah anda?" across different flows)
@@ -19,7 +19,6 @@ A Streamlit web application that cleans and processes Interactive Voice Response
 Upload your IVR CSV files via:
 - **ZIP file** (recommended for multiple files)
 - **Individual CSV files**
-- **Google Drive file links** (one per line, files must be shared as "Anyone with the link")
 
 ### Step 2: Upload IVR Script
 Upload the IVR call script document (PDF or DOCX). The app parses:
@@ -127,7 +126,6 @@ The slider in Step 4 controls how strictly incomplete responses are removed:
 - `streamlit` - Web application framework
 - `pandas` - Data manipulation
 - `numpy` - Numerical operations
-- `gdown` - Google Drive file downloads
 - `pdfplumber` - PDF text extraction
 - `python-docx` - DOCX document parsing
 - `openpyxl` - Excel file generation

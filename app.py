@@ -14,10 +14,8 @@ import re
 import io
 from parsers import parse_ivr_script
 from cleaning import (
-    load_all_csvs_from_folder,
     load_all_csvs_from_bytes,
     load_csvs_from_zip,
-    load_csv_from_gdrive_links,
     detect_flow_columns,
     apply_column_renames,
     apply_flow_value_mapping,
@@ -117,88 +115,50 @@ if st.session_state.step == 1:
     Upload or link your IVR CSV files to get started.
     """)
     
-    # Input method selection
-    input_method = st.radio(
-        "Choose input method:",
-        ["Upload CSV Files", "Google Drive File Links"],
+    upload_type = st.radio(
+        "File format:",
+        ["ZIP file (recommended)", "Individual CSV files"],
         horizontal=True,
     )
-    
-    if input_method == "Upload CSV Files":
-        upload_type = st.radio(
-            "File format:",
-            ["ZIP file (recommended)", "Individual CSV files"],
-            horizontal=True,
+
+    if upload_type == "ZIP file (recommended)":
+        uploaded_zip = st.file_uploader(
+            "Upload ZIP file containing CSV files",
+            type=['zip'],
+            accept_multiple_files=False,
+            help="Upload a ZIP file containing one or more IVR CSV files."
         )
 
-        if upload_type == "ZIP file (recommended)":
-            uploaded_zip = st.file_uploader(
-                "Upload ZIP file containing CSV files",
-                type=['zip'],
-                accept_multiple_files=False,
-                help="Upload a ZIP file containing one or more IVR CSV files."
-            )
-
-            if uploaded_zip and st.button("📂 Load from ZIP", type="primary"):
-                with st.spinner("Extracting and loading CSV files from ZIP..."):
-                    try:
-                        zip_bytes = uploaded_zip.read()
-                        combined_df, num_files, file_names = load_csvs_from_zip(zip_bytes)
-                        st.session_state.raw_df = combined_df
-                        st.session_state.num_files = num_files
-                        st.success(f"Successfully loaded {num_files} CSV file(s) with {len(combined_df)} total rows.")
-                        with st.expander(f"📂 Files loaded from ZIP ({num_files})"):
-                            for name in file_names:
-                                st.write(f"- {name}")
-                    except Exception as e:
-                        st.error(f"Error loading data: {str(e)}")
-        else:
-            uploaded_csvs = st.file_uploader(
-                "Upload CSV Files",
-                type=['csv'],
-                accept_multiple_files=True,
-                help="Upload one or more IVR CSV files."
-            )
-
-            if uploaded_csvs and st.button("📂 Load Uploaded Data", type="primary"):
-                with st.spinner("Loading CSV files..."):
-                    try:
-                        combined_df = load_all_csvs_from_bytes(uploaded_csvs)
-                        st.session_state.raw_df = combined_df
-                        st.session_state.num_files = len(uploaded_csvs)
-                        st.success(f"Successfully loaded {len(uploaded_csvs)} CSV file(s) with {len(combined_df)} total rows.")
-                    except Exception as e:
-                        st.error(f"Error loading data: {str(e)}")
-    
-    else:
-        st.markdown("""
-        Paste Google Drive file links below (one per line). 
-        Each file must be shared as **"Anyone with the link"**.
-        
-        Example:
-        ```
-        https://drive.google.com/file/d/FILE_ID_1/view
-        https://drive.google.com/file/d/FILE_ID_2/view
-        ```
-        """)
-        
-        gdrive_links = st.text_area(
-            "Google Drive File Links",
-            placeholder="https://drive.google.com/file/d/xxxxx/view\nhttps://drive.google.com/file/d/yyyyy/view",
-            help="Paste Google Drive file links, one per line.",
-            height=150,
-        )
-        
-        if st.button("📂 Load Data from Google Drive", type="primary", disabled=not gdrive_links.strip()):
-            with st.spinner("Loading CSV files from Google Drive..."):
+        if uploaded_zip and st.button("📂 Load from ZIP", type="primary"):
+            with st.spinner("Extracting and loading CSV files from ZIP..."):
                 try:
-                    combined_df, num_files = load_csv_from_gdrive_links(gdrive_links)
+                    zip_bytes = uploaded_zip.read()
+                    combined_df, num_files, file_names = load_csvs_from_zip(zip_bytes)
                     st.session_state.raw_df = combined_df
                     st.session_state.num_files = num_files
                     st.success(f"Successfully loaded {num_files} CSV file(s) with {len(combined_df)} total rows.")
+                    with st.expander(f"📂 Files loaded from ZIP ({num_files})"):
+                        for name in file_names:
+                            st.write(f"- {name}")
                 except Exception as e:
                     st.error(f"Error loading data: {str(e)}")
-                    st.info("💡 Make sure each file is shared as 'Anyone with the link can view'.")
+    else:
+        uploaded_csvs = st.file_uploader(
+            "Upload CSV Files",
+            type=['csv'],
+            accept_multiple_files=True,
+            help="Upload one or more IVR CSV files."
+        )
+
+        if uploaded_csvs and st.button("📂 Load Uploaded Data", type="primary"):
+            with st.spinner("Loading CSV files..."):
+                try:
+                    combined_df = load_all_csvs_from_bytes(uploaded_csvs)
+                    st.session_state.raw_df = combined_df
+                    st.session_state.num_files = len(uploaded_csvs)
+                    st.success(f"Successfully loaded {len(uploaded_csvs)} CSV file(s) with {len(combined_df)} total rows.")
+                except Exception as e:
+                    st.error(f"Error loading data: {str(e)}")
     
     # Show raw data preview if loaded
     if st.session_state.raw_df is not None:
