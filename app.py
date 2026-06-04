@@ -49,6 +49,10 @@ if 'flow_to_question' not in st.session_state:
     st.session_state.flow_to_question = {}
 if 'flow_value_mapping' not in st.session_state:
     st.session_state.flow_value_mapping = {}
+if 'flow_graph' not in st.session_state:
+    st.session_state.flow_graph = {}
+if 'branch_groups' not in st.session_state:
+    st.session_state.branch_groups = []
 if 'flow_to_cols' not in st.session_state:
     st.session_state.flow_to_cols = {}
 if 'rename_map' not in st.session_state:
@@ -59,6 +63,8 @@ if 'cleaned_df' not in st.session_state:
     st.session_state.cleaned_df = None
 if 'skipped_df' not in st.session_state:
     st.session_state.skipped_df = None
+if 'skipped_label' not in st.session_state:
+    st.session_state.skipped_label = "Skipped"
 if 'completeness_threshold' not in st.session_state:
     st.session_state.completeness_threshold = 1.0
 
@@ -72,6 +78,8 @@ def reset_from_step(step: int):
     if step <= 2:
         st.session_state.flow_to_question = {}
         st.session_state.flow_value_mapping = {}
+        st.session_state.flow_graph = {}
+        st.session_state.branch_groups = []
     if step <= 3:
         st.session_state.flow_to_cols = {}
         st.session_state.rename_map = {}
@@ -81,13 +89,15 @@ def reset_from_step(step: int):
     st.session_state.step = step
 
 
-def to_excel(main_df: pd.DataFrame, skipped_df: pd.DataFrame = None) -> bytes:
+def to_excel(main_df: pd.DataFrame, skipped_df: pd.DataFrame = None, skipped_label: str = "Skipped") -> bytes:
     """Convert DataFrame(s) to Excel bytes for download with multiple sheets."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         main_df.to_excel(writer, index=False, sheet_name='Main Survey')
         if skipped_df is not None and not skipped_df.empty:
-            skipped_df.to_excel(writer, index=False, sheet_name='Skipped (FlowNo_2=2)')
+            # Truncate sheet name to 31 chars (Excel limit)
+            sheet_name = skipped_label[:31]
+            skipped_df.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
 
@@ -207,7 +217,7 @@ if st.session_state.step == 1:
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Rows", f"{st.session_state.raw_df.shape[0]:,}")
-        col2.metric("Total Columns", f"{st.session_state.raw_df.shape[1]}")
+        col2.metric("Total Columns", st.session_state.raw_df.shape[1])
         col3.metric("Files Loaded", st.session_state.num_files)
         
         st.dataframe(st.session_state.raw_df.head(20), use_container_width=True)
@@ -241,7 +251,7 @@ elif st.session_state.step == 2:
         with st.spinner("Parsing IVR script..."):
             try:
                 file_bytes = uploaded_script.read()
-                flow_to_question, flow_value_mapping = parse_ivr_script(
+                flow_to_question, flow_value_mapping, flow_graph, branch_groups = parse_ivr_script(
                     file_bytes, uploaded_script.name
                 )
                 
@@ -250,7 +260,13 @@ elif st.session_state.step == 2:
                 else:
                     st.session_state.flow_to_question = flow_to_question
                     st.session_state.flow_value_mapping = flow_value_mapping
-                    st.success(f"Parsed {len(flow_to_question)} questions and {len(flow_value_mapping)} answer mappings.")
+                    st.session_state.flow_graph = flow_graph
+                    st.session_state.branch_groups = branch_groups
+                    st.success(
+                        f"Parsed {len(flow_to_question)} questions, "
+                        f"{len(flow_value_mapping)} answer mappings, "
+                        f"{len(branch_groups)} branch group(s)."
+                    )
             except Exception as e:
                 st.error(f"Error parsing script: {str(e)}")
     
@@ -271,6 +287,26 @@ elif st.session_state.step == 2:
                     st.markdown("**Answer Choices:**")
                     for key, answer in sorted(flow_answers.items()):
                         st.markdown(f"- `{key}` → {answer}")
+                # Show redirect info from flow graph
+                flow_info = st.session_state.flow_graph.get(flow_num, {})
+                redirects = flow_info.get('answer_redirects', {})
+                if redirects:
+                    st.markdown("**Redirects:**")
+                    for choice, target in sorted(redirects.items()):
+                        st.markdown(f"- Option {choice} → Call Flow {target}")
+
+        # Show branch groups
+        if st.session_state.branch_groups:
+            st.divider()
+            st.subheader("🔀 Detected Branch Groups (Mutually Exclusive Flows)")
+            for i, group in enumerate(st.session_state.branch_groups):
+                group_desc = []
+                for fn in group:
+                    q = st.session_state.flow_to_question.get(fn, "Unknown")
+                    group_desc.append(f"Flow {fn}: {q[:60]}")
+                with st.expander(f"Branch Group {i+1}: Flows {group}"):
+                    for desc in group_desc:
+                        st.markdown(f"- {desc}")
         
         st.divider()
         st.subheader("✏️ Edit Mappings (Optional)")
@@ -355,6 +391,7 @@ elif st.session_state.step == 3:
     flow_to_cols = st.session_state.flow_to_cols
     flow_to_question = st.session_state.flow_to_question
     flow_value_mapping = st.session_state.flow_value_mapping
+    branch_groups = st.session_state.branch_groups
     
     # Show detected mappings
     st.subheader("🔍 Detected Column → Flow Mappings")
@@ -366,11 +403,18 @@ elif st.session_state.step == 3:
         for flow_num in sorted(flow_to_cols.keys()):
             cols = flow_to_cols[flow_num]
             question = flow_to_question.get(flow_num, "❓ No question found")
+            # Mark if this flow is in a branch group
+            branch_label = ""
+            for i, group in enumerate(branch_groups):
+                if flow_num in group:
+                    branch_label = f"🔀 Branch Group {i+1}"
+                    break
             for col_idx in cols:
                 mapping_data.append({
                     "Data Column": col_idx,
                     "Flow Number": flow_num,
                     "Question": question[:100] + "..." if len(question) > 100 else question,
+                    "Branch": branch_label if branch_label else "—",
                 })
         
         mapping_df = pd.DataFrame(mapping_data)
@@ -382,7 +426,7 @@ elif st.session_state.step == 3:
             if fn not in flow_to_question
         ]
         if unmatched_flows:
-            st.warning(f"⚠️ Flow number(s) {unmatched_flows} found in data but not in the script. These columns will keep their numeric names.")
+            st.warning(f"⚠️ Flow number(s) {unmatched_flows} found in data but not in the script. These columns will be dropped during cleaning.")
         
         unmatched_questions = [
             fn for fn in flow_to_question.keys()
@@ -423,10 +467,11 @@ elif st.session_state.step == 3:
             # Save skipped data for export in a separate sheet
             if not skipped_df_raw.empty:
                 skipped_renamed, _ = apply_column_renames(
-                    skipped_df_raw, flow_to_question, flow_to_cols
+                    skipped_df_raw, flow_to_question, flow_to_cols, branch_groups
                 )
                 skipped_mapped = apply_flow_value_mapping(skipped_renamed, flow_value_mapping)
                 st.session_state.skipped_df = skipped_mapped
+                st.session_state.skipped_label = f"Skipped ({detected_flows[0]['skip_value']})"
             df = main_df_raw
             st.success(f"✅ Filtering to {len(df)} main survey respondents. Skipped data will be in a separate Excel sheet.")
         else:
@@ -442,7 +487,7 @@ elif st.session_state.step == 3:
         with st.spinner("Applying transformations..."):
             # Step 3a: Rename columns
             df_renamed, rename_map = apply_column_renames(
-                df, flow_to_question, flow_to_cols
+                df, flow_to_question, flow_to_cols, branch_groups
             )
             st.session_state.rename_map = rename_map
             
@@ -546,16 +591,37 @@ elif st.session_state.step == 4:
             "Minimum data completeness threshold",
             min_value=0.0, max_value=1.0, value=st.session_state.completeness_threshold,
             step=0.05,
-            help="Rows must have at least this fraction of active columns filled to be kept. "
-                 "0.0 = keep all rows (only drop fully empty), 1.0 = drop any row with a missing value. "
-                 "For branching IVR surveys, try 0.5-0.7 to allow for branch-specific empty columns."
+            help="Rows must have at least this fraction of common (non-branch) columns filled to be kept. "
+                 "0.0 = keep all rows (only drop fully empty), 1.0 = drop any row with a missing value in common columns. "
+                 "Branch-specific columns (from skip logic) are handled separately — "
+                 "respondents only need to answer at least one column per branch group."
         )
+
+        # Show branch group info
+        branch_groups = st.session_state.branch_groups
+        flow_to_question = st.session_state.flow_to_question
+        if branch_groups:
+            with st.expander("ℹ️ Branch Groups (Skip Logic)"):
+                st.markdown(
+                    "The following groups of mutually exclusive flows were detected. "
+                    "Respondents only need to answer **at least one** column in each group to be considered complete."
+                )
+                for i, group in enumerate(branch_groups):
+                    group_qs = []
+                    for fn in group:
+                        q = flow_to_question.get(fn, f"Flow {fn}")
+                        group_qs.append(f"**Flow {fn}**: {q[:80]}")
+                    st.markdown(f"**Group {i+1}** (Flows {group}):")
+                    for gq in group_qs:
+                        st.markdown(f"  - {gq}")
 
         # Always recalculate with current threshold
         with st.spinner("Cleaning data..."):
             df = clean_data(
                 st.session_state.mapped_df,
-                completeness_threshold=st.session_state.completeness_threshold
+                completeness_threshold=st.session_state.completeness_threshold,
+                branch_groups=branch_groups,
+                flow_to_question=flow_to_question,
             )
         st.session_state.cleaned_df = df
         
@@ -632,7 +698,11 @@ elif st.session_state.step == 4:
         st.divider()
         st.subheader("📥 Export Data")
         
-        excel_bytes = to_excel(df, st.session_state.skipped_df)
+        excel_bytes = to_excel(
+            df,
+            st.session_state.skipped_df,
+            st.session_state.skipped_label,
+        )
         
         st.download_button(
             label="📥 Download as Excel",

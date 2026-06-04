@@ -1,6 +1,11 @@
 """
 IVR data loading and cleaning logic.
 Handles loading CSV files from Google Drive and cleaning the data.
+
+Supports generalized IVR skip logic handling:
+- Simple skip logic (e.g., Johor: Q6 → different next question)
+- Multi-layer skip logic (e.g., Penang: Q2 branches into different question sets)
+- Branch-aware completeness checking (respondents aren't penalized for branch-specific NaN)
 """
 
 import os
@@ -347,12 +352,14 @@ def _get_core_question(question_text: str) -> str:
 def apply_column_renames(
     df: pd.DataFrame,
     flow_to_question: Dict[int, str],
-    flow_to_cols: Dict[int, List[int]]
+    flow_to_cols: Dict[int, List[int]],
+    branch_groups: List[List[int]] = None,
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Rename DataFrame columns using the question text from the parsed script.
     Then merge columns that have the same core question text (after stripping
-    "Soalan N." prefixes).
+    "Soalan N." prefixes), AND merge columns within the same branch group
+    that map to equivalent questions.
 
     This handles multi-layer branching IVR where the same sub-question
     (e.g., "Di parlimen manakah anda?") appears across multiple flows
@@ -360,10 +367,15 @@ def apply_column_renames(
     only answered ONE of them, so merging produces a single column
     with all answers coalesced.
 
+    Additionally, for branch groups where flows have DIFFERENT questions
+    but are mutually exclusive (e.g., Flow 9 Q8 + Flow 10 Q9 in Johor),
+    we do NOT merge those — they remain as separate columns.
+
     Args:
         df: DataFrame with numeric column names
         flow_to_question: Mapping from flow number to question text
         flow_to_cols: Mapping from flow number to column indices
+        branch_groups: List of mutually exclusive flow groups (from parser)
 
     Returns:
         Tuple of (renamed & merged DataFrame, mapping dict {old_col_name: new_name})
@@ -438,6 +450,69 @@ def apply_column_renames(
 
     df_merged = pd.DataFrame(result_cols)
     return df_merged, rename_map
+
+
+def _classify_columns(
+    df: pd.DataFrame,
+    branch_groups: List[List[int]],
+    flow_to_question: Dict[int, str],
+) -> Tuple[List[str], List[str], Dict[str, List[str]]]:
+    """
+    Classify DataFrame columns into common and branch-specific groups.
+
+    Uses the branch_groups from the parser to determine which columns
+    are mutually exclusive branches.
+
+    Args:
+        df: DataFrame with renamed columns
+        branch_groups: List of mutually exclusive flow groups
+        flow_to_question: Mapping from flow number to question text
+
+    Returns:
+        Tuple of (common_cols, branch_specific_cols, branch_col_groups)
+        - common_cols: columns answered by all respondents on main path
+        - branch_specific_cols: columns that are branch-specific
+        - branch_col_groups: Dict mapping group_key -> list of column names
+          (respondents need at least one non-null in each group)
+    """
+    def _get_core(text: str) -> str:
+        stripped = re.sub(r'^Soalan\s+\w+(\s+\w+)*\.\s*', '', text, flags=re.IGNORECASE)
+        return stripped.strip() if stripped.strip() else text.strip()
+
+    question_cols = [c for c in df.columns if c not in ['phonenum', 'Mode']]
+
+    # Build set of branch-specific core questions
+    branch_core_questions: Dict[str, List[str]] = {}  # group_key -> list of col names
+
+    if branch_groups:
+        for group_idx, group in enumerate(branch_groups):
+            # Get core questions for each flow in this group
+            group_cores = set()
+            for flow_num in group:
+                if flow_num in flow_to_question:
+                    core = _get_core(flow_to_question[flow_num])
+                    group_cores.add(core)
+
+            # Find DataFrame columns that match these core questions
+            group_cols = []
+            for col in question_cols:
+                col_core = _get_core(str(col))
+                if col_core in group_cores:
+                    group_cols.append(col)
+
+            if len(group_cols) >= 2:
+                group_key = f"branch_group_{group_idx}"
+                branch_core_questions[group_key] = group_cols
+
+    # Classify columns
+    branch_specific_cols = set()
+    for group_key, cols in branch_core_questions.items():
+        branch_specific_cols.update(cols)
+
+    common_cols = [c for c in question_cols if c not in branch_specific_cols]
+    branch_specific_list = list(branch_specific_cols)
+
+    return common_cols, branch_specific_list, branch_core_questions
 
 
 def apply_flow_value_mapping(
@@ -605,25 +680,29 @@ def auto_filter_screening(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame,
     return df, pd.DataFrame(), []
 
 
-def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.DataFrame:
+def clean_data(
+    df: pd.DataFrame,
+    completeness_threshold: float = 0.8,
+    branch_groups: List[List[int]] = None,
+    flow_to_question: Dict[int, str] = None,
+) -> pd.DataFrame:
     """
-    Clean IVR data for branching/multi-level IVR surveys:
-    1. Thoroughly convert all null-like values to actual np.nan
-    2. Identify branch-specific columns (mutually exclusive flows)
-    3. Drop rows with too many NaN answers (using only common columns)
-    4. Remove duplicate phone numbers (keep first occurrence)
-    5. Add Mode column
+    Clean IVR data with branch-aware completeness checking.
 
-    Branch-specific columns are automatically identified: columns with
-    30-70% null values are likely mutually exclusive branches (e.g.,
-    Flow 9 vs Flow 10 in Johor IVR). These are excluded from the
-    completeness check so respondents aren't penalized for taking a
-    different branch.
+    Handles both simple and multi-layer skip logic by:
+    1. Classifying columns as common vs branch-specific using branch_groups
+    2. For branch groups, requiring respondents to answer at least ONE column
+       in the group (not all)
+    3. Only using common columns for the completeness threshold check
+    4. Removing unmapped/extra columns before export
+    5. Removing columns with 100% null (truly unused flows like FlowNo_1)
 
     Args:
         df: DataFrame to clean
         completeness_threshold: 0.0-1.0, minimum fraction of COMMON cols
                                that must be non-null (default 0.8)
+        branch_groups: List of mutually exclusive flow groups from parser
+        flow_to_question: Mapping from flow number to question text
 
     Returns:
         Cleaned DataFrame
@@ -647,9 +726,6 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
 
     # Step 3: Aggressive second pass - catch ANY remaining null-like values.
-    # This is critical because data flows through multiple transformations
-    # (merge, flow value mapping) that can introduce new null-like values.
-    # Also catches unmapped FlowNo values (e.g., FlowNo_10=1 that wasn't in mapping).
     flow_pattern = re.compile(r'^FlowNo_\d+=\d+$')
     for col in question_cols:
         def _to_nan(x, _pat=flow_pattern):
@@ -665,7 +741,42 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
             return x
         df_clean[col] = df_clean[col].apply(_to_nan)
 
-    # Step 4: Find the "last question" column - the most reliable completion indicator.
+    # Step 3.5: Remove unmapped/extra columns.
+    # Columns that are still numeric indices (int) were never renamed by the parser,
+    # meaning they don't correspond to any question in the script.
+    # Also remove columns that are 100% null (truly unused flows).
+    cols_to_drop = []
+    for col in df_clean.columns:
+        if col in ['phonenum', 'Mode']:
+            continue
+        # Drop columns that are still numeric (unmapped)
+        if isinstance(col, (int, float)):
+            cols_to_drop.append(col)
+            continue
+        # Drop columns that are entirely NaN
+        if df_clean[col].isnull().all():
+            cols_to_drop.append(col)
+
+    if cols_to_drop:
+        df_clean = df_clean.drop(columns=cols_to_drop)
+
+    # Recalculate question_cols after dropping
+    question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
+
+    # Step 4: Classify columns as common vs branch-specific
+    common_cols = question_cols
+    branch_col_groups = {}
+
+    if branch_groups and flow_to_question:
+        common_cols_list, branch_specific_cols, branch_col_groups = _classify_columns(
+            df_clean, branch_groups, flow_to_question
+        )
+        # common_cols_list may be empty if all columns are branch-specific
+        # In that case, use all question_cols as common
+        if common_cols_list:
+            common_cols = common_cols_list
+
+    # Step 5: Find the "last question" column for completion detection
     last_q_col = None
     for col in question_cols:
         col_lower = str(col).lower()
@@ -673,39 +784,41 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
             last_q_col = col
             break
 
-    # Step 5: Separate out columns that are entirely NaN (>95% null)
-    # These are skip-logic branches that don't apply to this group
-    active_cols = []
-    for col in question_cols:
-        null_pct = df_clean[col].isnull().mean()
-        if null_pct < 0.95:
-            active_cols.append(col)
-
-    # Step 6: Drop incomplete responses.
-    # Strategy: If "Soalan terakhir" column exists, use it as completion indicator.
-    # Otherwise fall back to threshold-based cleaning on active columns.
+    # Step 6: Drop incomplete responses using branch-aware logic.
+    #
+    # Branch-aware completeness:
+    # - For COMMON columns: apply the completeness threshold
+    # - For BRANCH GROUPS: respondent is "complete" for a group if they have
+    #   at least one non-null value in ANY column of the group
     #
     # IMPORTANT: Respondents who answered "Lain-lain" (Others) were redirected
     # to the end early (e.g., "Lain-lain" -> Call flow 24 = End). These are
     # VALID responses even though they skipped later questions.
-    # We keep them by requiring at least 2 non-null answers (screening + at least
-    # one real answer) rather than requiring ALL questions to be answered.
+
     if last_q_col:
-        # Primary strategy: keep only respondents who answered the last question.
-        # "Soalan terakhir" is the most reliable completion indicator.
-        # If the IVR redirected them to the end early (e.g., "Lain-lain"),
-        # the last question column may be NaN for valid redirect paths.
-        # For those, fall back to threshold-based cleaning.
+        # Primary strategy: keep respondents who answered the last question
         has_last_q = df_clean[last_q_col].notna()
 
         # For respondents who didn't answer the last question,
-        # keep them only if they have enough non-null answers
-        # (meaningful engagement before redirect/hang-up)
-        if active_cols:
-            non_null_counts = df_clean[active_cols].notna().sum(axis=1)
-            # Use the threshold as the minimum fraction of active columns answered
-            completeness = non_null_counts / len(active_cols)
-            keep_mask = has_last_q | (completeness >= completeness_threshold)
+        # use branch-aware completeness
+        if common_cols:
+            # Count non-null common columns
+            common_non_null = df_clean[common_cols].notna().sum(axis=1)
+
+            # For each branch group, count as "complete" (1) if any column in the group
+            # has a non-null value, else 0
+            branch_completeness_score = pd.Series(0, index=df_clean.index)
+            if branch_col_groups:
+                for group_key, group_cols in branch_col_groups.items():
+                    group_present = [c for c in group_cols if c in df_clean.columns]
+                    if group_present:
+                        group_has_any = df_clean[group_present].notna().any(axis=1).astype(int)
+                        branch_completeness_score += group_has_any
+                total_completeness = (common_non_null + branch_completeness_score) / (len(common_cols) + len(branch_col_groups))
+            else:
+                total_completeness = common_non_null / len(common_cols) if len(common_cols) > 0 else pd.Series(1.0, index=df_clean.index)
+
+            keep_mask = has_last_q | (total_completeness >= completeness_threshold)
         else:
             keep_mask = has_last_q
 
@@ -714,11 +827,22 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
         dropped = before_count - len(df_clean)
         if dropped > 0:
             print(f"Dropped {dropped} incomplete responses")
-    elif active_cols:
-        # Fallback: no "last question" column - use threshold
-        non_null_counts = df_clean[active_cols].notna().sum(axis=1)
-        completeness = non_null_counts / len(active_cols)
-        df_clean = df_clean[completeness >= completeness_threshold]
+    elif common_cols:
+        # Fallback: no "last question" column - use branch-aware threshold
+        common_non_null = df_clean[common_cols].notna().sum(axis=1)
+
+        branch_completeness_score = pd.Series(0, index=df_clean.index)
+        if branch_col_groups:
+            for group_key, group_cols in branch_col_groups.items():
+                group_present = [c for c in group_cols if c in df_clean.columns]
+                if group_present:
+                    group_has_any = df_clean[group_present].notna().any(axis=1).astype(int)
+                    branch_completeness_score += group_has_any
+            total_completeness = (common_non_null + branch_completeness_score) / (len(common_cols) + len(branch_col_groups))
+        else:
+            total_completeness = common_non_null / len(common_cols) if len(common_cols) > 0 else pd.Series(1.0, index=df_clean.index)
+
+        df_clean = df_clean[total_completeness >= completeness_threshold]
 
     # Step 7: Remove duplicate phone numbers (keep first occurrence)
     if 'phonenum' in df_clean.columns:
