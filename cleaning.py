@@ -317,6 +317,33 @@ def detect_flow_columns(df: pd.DataFrame) -> Dict[int, List[int]]:
     return flow_to_cols
 
 
+def _get_core_question(question_text: str) -> str:
+    """
+    Extract the core question text by stripping common prefixes like
+    "Soalan pertama.", "Soalan kedua.", "Soalan ketiga.", etc.
+    
+    This allows merging columns that have the same core question
+    but different question number prefixes from different flows.
+    
+    Examples:
+        "Soalan ketiga. Di parlimen manakah anda?" → "Di parlimen manakah anda?"
+        "Soalan keempat. Di parlimen manakah anda?" → "Di parlimen manakah anda?"
+        "Soalan kelapan. Sudikah anda mengundi?" → "Sudikah anda mengundi?"
+        "Di parlimen manakah anda?" → "Di parlimen manakah anda?" (no prefix, unchanged)
+    """
+    # Strip "Soalan [ordinal]." prefix pattern
+    # Matches: "Soalan pertama.", "Soalan kedua.", "Soalan ketiga belas.", etc.
+    stripped = re.sub(
+        r'^Soalan\s+\w+(\s+\w+)*\.\s*',
+        '',
+        question_text,
+        flags=re.IGNORECASE
+    )
+    # If stripping removed something, return the stripped version
+    # Otherwise return the original
+    return stripped.strip() if stripped.strip() else question_text.strip()
+
+
 def apply_column_renames(
     df: pd.DataFrame,
     flow_to_question: Dict[int, str],
@@ -324,7 +351,14 @@ def apply_column_renames(
 ) -> Tuple[pd.DataFrame, Dict]:
     """
     Rename DataFrame columns using the question text from the parsed script.
-    Handles duplicate column names by appending a suffix.
+    Then merge columns that have the same core question text (after stripping
+    "Soalan N." prefixes).
+
+    This handles multi-layer branching IVR where the same sub-question
+    (e.g., "Di parlimen manakah anda?") appears across multiple flows
+    (Flow 4, 5, 6, 7, 8) with different prefixes — each respondent
+    only answered ONE of them, so merging produces a single column
+    with all answers coalesced.
 
     Args:
         df: DataFrame with numeric column names
@@ -332,7 +366,7 @@ def apply_column_renames(
         flow_to_cols: Mapping from flow number to column indices
 
     Returns:
-        Tuple of (renamed DataFrame, mapping dict {old_col_name: new_name})
+        Tuple of (renamed & merged DataFrame, mapping dict {old_col_name: new_name})
     """
     rename_map = {}
 
@@ -343,21 +377,67 @@ def apply_column_renames(
 
     df_renamed = df.rename(columns=rename_map)
 
-    # Handle duplicate column names by appending suffix
-    cols = list(df_renamed.columns)
-    seen = {}
-    new_cols = []
-    for col in cols:
-        col_str = str(col)
-        if col_str in seen:
-            seen[col_str] += 1
-            new_cols.append(f"{col_str} [{seen[col_str]}]")
+    # Build a mapping: original_col_name -> core_question
+    col_names = list(df_renamed.columns)
+    col_to_core: Dict[str, str] = {}
+    for col_name in col_names:
+        col_str = str(col_name)
+        if col_str == 'phonenum':
+            col_to_core[col_str] = col_str
         else:
-            seen[col_str] = 0
-            new_cols.append(col_str)
+            col_to_core[col_str] = _get_core_question(col_str)
 
-    df_renamed.columns = new_cols
-    return df_renamed, rename_map
+    # Group columns by their core question text
+    core_groups: Dict[str, List[int]] = {}  # core_question -> list of column positions
+    for pos, col_name in enumerate(col_names):
+        col_str = str(col_name)
+        core = col_to_core[col_str]
+        if core not in core_groups:
+            core_groups[core] = []
+        core_groups[core].append(pos)
+
+    # Build merged DataFrame
+    result_cols = {}
+    seen_cores = set()
+
+    for col_name in col_names:
+        col_str = str(col_name)
+        core = col_to_core[col_str]
+        if core in seen_cores:
+            continue
+        seen_cores.add(core)
+
+        positions = core_groups[core]
+
+        if len(positions) == 1:
+            # No merging needed - use the original column name
+            result_cols[col_str] = df_renamed.iloc[:, positions[0]].copy()
+        else:
+            # Merge: coalesce values across columns with same core question.
+            # IMPORTANT: data may contain string 'nan'/'NaN'/'None'/''
+            # instead of actual np.nan. fillna only works on actual NaN.
+            # So we must first convert null-like strings to np.nan.
+            null_like = {'', ' ', '  ', 'nan', 'NaN', 'NAN', 'None', 'none',
+                         'NONE', 'null', 'NULL', 'NaT', 'nat', '<NA>'}
+
+            # Start with first column, convert null-likes to NaN
+            merged = df_renamed.iloc[:, positions[0]].copy()
+            merged = merged.apply(
+                lambda x: np.nan if (isinstance(x, str) and x.strip() in null_like) else x
+            )
+
+            # Coalesce remaining columns
+            for pos in positions[1:]:
+                next_col = df_renamed.iloc[:, pos].copy()
+                next_col = next_col.apply(
+                    lambda x: np.nan if (isinstance(x, str) and x.strip() in null_like) else x
+                )
+                merged = merged.fillna(next_col)
+
+            result_cols[core] = merged
+
+    df_merged = pd.DataFrame(result_cols)
+    return df_merged, rename_map
 
 
 def apply_flow_value_mapping(
@@ -566,36 +646,46 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
     # Step 2: Identify question columns (all except phonenum and Mode)
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
 
-    # Step 3: Classify columns into "common" vs "branch-specific"
-    # - Columns with <10% null = common (almost all respondents answered)
-    # - Columns with 10-95% null = likely branch-specific (mutually exclusive flows)
-    #   These are EXCLUDED from the completeness check so respondents aren't
-    #   penalized for taking a different branch path
-    # - Columns with >95% null = likely entirely-NaN for this group (skip logic)
-    common_cols = []
-    branch_cols = []
+    # Step 3: Aggressive second pass - catch ANY remaining null-like values.
+    # This is critical because data flows through multiple transformations
+    # (merge, flow value mapping) that can introduce new null-like values.
+    # Also catches unmapped FlowNo values (e.g., FlowNo_10=1 that wasn't in mapping).
+    flow_pattern = re.compile(r'^FlowNo_\d+=\d+$')
+    for col in question_cols:
+        def _to_nan(x, _pat=flow_pattern):
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                return np.nan
+            if not isinstance(x, str):
+                return x
+            s = x.strip()
+            if s == '' or s.lower() in {'nan', 'none', 'null', 'nat', 'n/a', 'na', '<na>'}:
+                return np.nan
+            if _pat.match(s):
+                return np.nan
+            return x
+        df_clean[col] = df_clean[col].apply(_to_nan)
 
+    # Step 4: Separate out columns that are entirely NaN (>95% null)
+    # These are skip-logic branches that don't apply to this group
+    active_cols = []
     for col in question_cols:
         null_pct = df_clean[col].isnull().mean()
-        if null_pct < 0.10:
-            common_cols.append(col)
-        elif null_pct < 0.95:
-            branch_cols.append(col)
-        # Columns with >95% null are ignored (not in common or branch)
+        if null_pct < 0.95:
+            active_cols.append(col)
 
-    # Step 4: Drop rows where ALL columns are null (answered nothing)
-    all_active = common_cols + branch_cols
-    if all_active:
-        df_clean = df_clean.dropna(subset=all_active, how='all')
+    # Step 5: Drop rows where ALL active columns are null (answered nothing)
+    if active_cols:
+        df_clean = df_clean.dropna(subset=active_cols, how='all')
 
-    # Step 5: Drop rows below completeness threshold on COMMON columns only
-    # Branch-specific columns are excluded from the check
-    if common_cols:
-        non_null_counts = df_clean[common_cols].notna().sum(axis=1)
-        completeness = non_null_counts / len(common_cols)
+    # Step 6: Drop rows below completeness threshold on ALL active columns.
+    # This removes incomplete respondents who only answered a few questions
+    # and then hung up or were disconnected.
+    if active_cols:
+        non_null_counts = df_clean[active_cols].notna().sum(axis=1)
+        completeness = non_null_counts / len(active_cols)
         df_clean = df_clean[completeness >= completeness_threshold]
 
-    # Step 6: Remove duplicate phone numbers (keep first occurrence)
+    # Step 7: Remove duplicate phone numbers (keep first occurrence)
     if 'phonenum' in df_clean.columns:
         before_count = len(df_clean)
         df_clean = df_clean.drop_duplicates(subset='phonenum', keep='first')
@@ -603,7 +693,7 @@ def clean_data(df: pd.DataFrame, completeness_threshold: float = 0.8) -> pd.Data
         if dupes_removed > 0:
             print(f"Removed {dupes_removed} duplicate phone numbers")
 
-    # Step 7: Add Mode column
+    # Step 8: Add Mode column
     df_clean['Mode'] = 'IVR'
 
     return df_clean
