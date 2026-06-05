@@ -442,25 +442,70 @@ elif st.session_state.step == 3:
     st.divider()
     
     # ── Skip Logic (applied on RAW data BEFORE mapping) ────────────────────
+    # ── Skip Logic (applied on RAW data BEFORE mapping) ────────────────────
     st.divider()
     st.subheader("🔀 Skip Logic Filtering")
 
-    # Auto-detect screening flows from raw data
-    main_df_raw, skipped_df_raw, detected_flows = auto_filter_screening(df)
+    # Get all valid FlowNo values from the raw dataframe to populate dropdown
+    flow_pattern = re.compile(r'^FlowNo_(\d+)=(\d+)$')
+    all_flowno_vals = set()
+    for col in df.columns:
+        if col != 'phonenum':
+            for val in df[col].dropna().unique():
+                val_str = str(val).strip()
+                if flow_pattern.match(val_str):
+                    all_flowno_vals.add(val_str)
+    
+    # Sort logically by Flow Number then Option
+    all_flowno_vals = sorted(
+        list(all_flowno_vals), 
+        key=lambda x: (
+            int(re.match(r'^FlowNo_(\d+)=(\d+)$', x).group(1)), 
+            int(re.match(r'^FlowNo_(\d+)=(\d+)$', x).group(2))
+        )
+    )
 
+    # Try auto-detect to set a smart default
+    detected_flows = detect_screening_flows(df)
+    default_skip_val = None
     if detected_flows:
-        for sf in detected_flows:
-            st.info(
-                f"🔍 Detected screening flow: **{sf['skip_value']}** — "
-                f"**{sf['skip_count']}** respondents skipped (redirected), "
-                f"**{sf['main_count']}** continued with main survey."
-            )
+        default_skip_val = detected_flows[0]['skip_value']
+    elif "FlowNo_2=2" in all_flowno_vals:
+        default_skip_val = "FlowNo_2=2"
+    elif all_flowno_vals:
+        default_skip_val = all_flowno_vals[0]
+
+    default_idx = 0
+    if default_skip_val in all_flowno_vals:
+        default_idx = all_flowno_vals.index(default_skip_val)
+
+    enable_skip_logic = st.checkbox(
+        "Enable Skip Logic Filtering (Separate redirected respondents)",
+        value=True if all_flowno_vals else False,
+        help="Use this to isolate respondents who were screened out early (e.g. Non-voters)."
+    )
+
+    if enable_skip_logic and all_flowno_vals:
+        # Give the user the power to override the algorithm
+        selected_skip_val = st.selectbox(
+            "Select the answer that triggers the skip/redirect (Auto-detected default applied):",
+            options=all_flowno_vals,
+            index=default_idx,
+            format_func=lambda x: f"{x} → {flow_value_mapping.get(x, 'Unknown')}"
+        )
+
+        main_df_raw, skipped_df_raw = filter_skip_logic(df, selected_skip_val)
+
+        st.info(
+            f"🔍 **{selected_skip_val}**: "
+            f"**{len(skipped_df_raw)}** respondents skipped (redirected), "
+            f"**{len(main_df_raw)}** continued with the main survey."
+        )
 
         keep_main = st.checkbox(
             "Filter: Keep only main survey respondents (remove skipped)",
             value=True,
-            key="skip_logic_checkbox",
-            help="Uncheck to keep all respondents including those who were redirected."
+            key="skip_logic_checkbox"
         )
 
         if keep_main:
@@ -471,14 +516,15 @@ elif st.session_state.step == 3:
                 )
                 skipped_mapped = apply_flow_value_mapping(skipped_renamed, flow_value_mapping)
                 st.session_state.skipped_df = skipped_mapped
-                st.session_state.skipped_label = f"Skipped ({detected_flows[0]['skip_value']})"
+                st.session_state.skipped_label = f"Skipped ({selected_skip_val})"
             df = main_df_raw
-            st.success(f"✅ Filtering to {len(df)} main survey respondents. Skipped data will be in a separate Excel sheet.")
+            st.success(f"✅ Filtering to {len(df)} main survey respondents. Skipped data will be mapped to a separate Excel sheet.")
         else:
             st.session_state.skipped_df = pd.DataFrame()
             st.info(f"Keeping all {len(df)} respondents.")
     else:
-        st.info("ℹ️ No screening/skip logic auto-detected. All respondents will be included.")
+        st.session_state.skipped_df = pd.DataFrame()
+        st.info("ℹ️ Skip logic filtering disabled. All respondents will be included.")
 
     st.divider()
 

@@ -8,6 +8,7 @@ Handles multi-layer/branching IVR scripts where:
 - "Tekan X untuk Y Call flow N" indicates an answer that redirects to another flow
 - "Tekan N hingga M" is a range description for multi-item sub-questions
 - Duplicate question texts are disambiguated by appending the flow number
+- Likert scale matrices (e.g. Bomba, Polis) maintain their overarching context
 """
 
 import re
@@ -44,9 +45,7 @@ def clean_flow_line(text: str) -> str:
 
 
 def _disambiguate_questions(flow_to_question: Dict[int, str]) -> Dict[int, str]:
-    """
-    Ensure all question texts are unique by appending flow number to duplicates.
-    """
+    """Ensure all question texts are unique by appending flow number to duplicates."""
     from collections import Counter
     q_counts = Counter(flow_to_question.values())
     duplicates = {q for q, c in q_counts.items() if c > 1}
@@ -67,37 +66,12 @@ def _build_flow_graph(
     original_text: str,
     processed_text: str,
     cf_matches: list,
-    tekan_untuk_pattern,
+    tekan_untuk_pattern_loose,
     tekan_range_pattern,
 ) -> Dict[int, Dict]:
-    """
-    Build a flow graph capturing redirect relationships between flows.
-
-    Strategy: Iterate through the ORIGINAL text line by line. We identify
-    section boundaries (standalone "Soalan X ... Call flow N" lines) and
-    answer lines ("Tekan X untuk Y Call flow M" lines). Answer redirects
-    are assigned to the most recently seen section boundary.
-
-    This approach avoids position-mapping issues between original and
-    processed text, and correctly handles all skip logic patterns.
-
-    Args:
-        original_text: Original text with all "Call flow" patterns intact
-        processed_text: Text with redirect "Call flow M" stripped from Tekan lines
-        cf_matches: Standalone "Call flow N" matches from processed_text
-        tekan_untuk_pattern: Regex for "Tekan N untuk X"
-        tekan_range_pattern: Regex for "Tekan N hingga M"
-
-    Returns:
-        Dict mapping flow_num to a dict with:
-          - 'answer_redirects': Dict[int, int] mapping choice_num -> target_flow
-          - 'is_answer_branch': bool, True if this flow is a destination of a redirect
-    """
-    # Collect standalone flow numbers from processed_text matches
-    # (these are the section boundaries, not Tekan redirect lines)
+    """Build a flow graph capturing redirect relationships between flows."""
     standalone_flow_nums = {int(m.group(1)) for m in cf_matches}
 
-    # Scan original text line by line
     lines = original_text.split('\n')
     current_flow = None
     flow_graph: Dict[int, Dict] = {}
@@ -114,12 +88,10 @@ def _build_flow_graph(
         if not line_stripped:
             continue
 
-        # Check if this line is a "Tekan X untuk Y Call flow M" (answer with redirect)
-        tekan_match = tekan_untuk_pattern.search(line_stripped)
+        tekan_match = tekan_untuk_pattern_loose.search(line_stripped)
         redirect_match = tekan_redirect_re.search(line_stripped)
 
         if tekan_match and redirect_match:
-            # This is an answer line with a redirect
             choice_num = int(tekan_match.group(1))
             target_flow = int(redirect_match.group(2))
             all_redirect_targets.add(target_flow)
@@ -130,8 +102,6 @@ def _build_flow_graph(
                 flow_graph[current_flow]['answer_redirects'][choice_num] = target_flow
             continue
 
-        # Check if this line has a standalone "Call flow N" (section boundary)
-        # It's standalone if it's NOT a "Tekan X untuk" line
         if not tekan_match:
             cf_match = standalone_cf_re.search(line_stripped)
             if cf_match:
@@ -141,7 +111,6 @@ def _build_flow_graph(
                     if current_flow not in flow_graph:
                         flow_graph[current_flow] = {'answer_redirects': {}, 'is_answer_branch': False}
 
-    # Mark redirect target flows as branch-specific
     for target_flow in all_redirect_targets:
         if target_flow in flow_graph:
             flow_graph[target_flow]['is_answer_branch'] = True
@@ -160,25 +129,7 @@ def _identify_branch_groups(
     flow_to_question: Dict[int, str],
     flow_value_mapping: Dict[str, str],
 ) -> List[List[int]]:
-    """
-    Identify groups of mutually exclusive branch flows using multiple strategies:
-
-    Strategy 1: Flows with the same core question text (after stripping
-    "Soalan N." prefix) are branches of the same question.
-
-    Strategy 2: If a parent flow's answers redirect to multiple different
-    flows, those target flows form a branch group.
-
-    Strategy 3: If flows in an existing branch group each redirect ALL their
-    options to a single (different) target, the targets form a downstream
-    branch group. For example, if branch [4,5,6,7,8] exists, and flows
-    4,5,6,8 all redirect to Flow 9 while Flow 7 redirects to Flow 10,
-    then [9, 10] is a new branch group.
-
-    Returns:
-        List of lists, each inner list is a group of mutually exclusive flow numbers.
-    """
-    # Group by core question text
+    """Identify groups of mutually exclusive branch flows."""
     core_to_flows: Dict[str, List[int]] = {}
     for flow_num, question in flow_to_question.items():
         core = _get_core_question_text(question)
@@ -186,13 +137,11 @@ def _identify_branch_groups(
             core_to_flows[core] = []
         core_to_flows[core].append(flow_num)
 
-    # Strategy 1: Branch groups from shared core question text
     branch_groups: List[List[int]] = []
     for core, flows in core_to_flows.items():
         if len(flows) >= 2:
             branch_groups.append(sorted(flows))
 
-    # Strategy 2: Branch groups from parent redirect targets
     parent_redirect_groups: Dict[int, List[int]] = {}
     for flow_num, info in flow_graph.items():
         redirects = info.get('answer_redirects', {})
@@ -213,20 +162,15 @@ def _identify_branch_groups(
         if not merged:
             branch_groups.append(sorted_targets)
 
-    # Strategy 3: Downstream branch groups from merge-point analysis.
-    # For each existing branch group, check if flows in the group redirect
-    # to different single targets. Those targets form a new branch group.
     new_groups: List[List[int]] = []
     for group in branch_groups:
-        # For each flow in the group, find where it redirects ALL its options
-        merge_targets: Dict[int, List[int]] = {}  # merge_target -> list of source flows
+        merge_targets: Dict[int, List[int]] = {}  
         for flow_num in group:
             if flow_num not in flow_graph:
                 continue
             redirects = flow_graph[flow_num].get('answer_redirects', {})
             if not redirects:
                 continue
-            # Check if ALL options redirect to the SAME single target
             unique_targets = set(redirects.values())
             if len(unique_targets) == 1:
                 target = list(unique_targets)[0]
@@ -234,14 +178,11 @@ def _identify_branch_groups(
                     merge_targets[target] = []
                 merge_targets[target].append(flow_num)
 
-        # If there are multiple distinct merge targets, they form a branch group
         if len(merge_targets) >= 2:
             downstream_group = sorted(merge_targets.keys())
             new_groups.append(downstream_group)
 
-    # Add new downstream groups
     for new_group in new_groups:
-        # Check if it overlaps with existing groups
         merged = False
         for existing in branch_groups:
             if len(set(existing) & set(new_group)) >= 2:
@@ -252,7 +193,6 @@ def _identify_branch_groups(
         if not merged:
             branch_groups.append(new_group)
 
-    # Deduplicate
     unique_groups = []
     seen = set()
     for group in branch_groups:
@@ -273,16 +213,6 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     """
     Parse an IVR script document to extract questions, answer mappings,
     flow graph, and branch groups.
-
-    Args:
-        file_bytes: Raw bytes of the uploaded file
-        filename: Name of the file (used to detect format)
-
-    Returns:
-        flow_to_question: Mapping of flow number to question text
-        flow_value_mapping: Mapping of FlowNo_X=Y to answer text
-        flow_graph: Mapping of flow number to flow info dict
-        branch_groups: List of mutually exclusive flow groups
     """
     filename_lower = filename.lower()
     if filename_lower.endswith('.pdf'):
@@ -296,48 +226,43 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     text = clean_flow_line(text)
 
     # ── Regex patterns ───────────────────────────────────────────────────
-    # "Tekan N untuk X Call flow M" - answer with redirect routing
+    # STRICT PATTERNS: Use ^\s* to ensure it only matches at the start of a line.
     tekan_redirect_pattern = re.compile(
-        r'(Tekan\s+\d+\s+untuk\s+.+?)\s+Call\s+flow\s+\d+',
+        r'^\s*(Tekan\s+\d+\s+untuk\s+.+?)\s+Call\s+flow\s+\d+',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    tekan_untuk_pattern_strict = re.compile(
+        r'^\s*Tekan\s+(\d+)\s+untuk\s+(.+)',
         re.IGNORECASE
     )
 
-    # "Tekan N untuk X" - standard answer (no redirect)
-    tekan_untuk_pattern = re.compile(
+    tekan_untuk_pattern_loose = re.compile(
         r'Tekan\s+(\d+)\s+untuk\s+(.+)',
         re.IGNORECASE
     )
 
-    # "Tekan N hingga M" - range description in question text (NOT an answer)
     tekan_range_pattern = re.compile(r'Tekan\s+\d+\s+hingga\s+\d+', re.IGNORECASE)
 
-    # Multi-item pattern: "Entity Name tekan N hingga M Call flow X"
     multi_item_pattern = re.compile(
         r'(.+?)\s+tekan\s+(\d+)\s+hingga\s+(\d+)\s+Call\s+flow\s+(\d+)',
         re.IGNORECASE
     )
 
-    # Skip patterns for greeting/intro/instruction lines
     skip_patterns = [
         'salam sejahtera', 'terima kasih', 'kajian bebas', 'cpi',
         'hanya merangkumi', 'soalan untuk bukan pengundi',
         'berdasarkan', 'jawab soalan', 'jawab ini',
     ]
 
-    # ── Pre-process: Handle "Tekan N untuk X Call flow M" lines ─────────
-    # These are answers WITH routing, not section boundaries.
-    # Strategy: replace "Call flow M" in these lines with a placeholder
-    # so they don't get treated as section boundaries.
-
     def replace_redirect(match):
         """Replace 'Call flow M' in Tekan lines with a placeholder."""
-        tekan_text = match.group(1)  # "Tekan N untuk X"
-        tekan_match = tekan_untuk_pattern.search(tekan_text)
+        tekan_text = match.group(1) 
+        tekan_match = tekan_untuk_pattern_loose.search(tekan_text)
         if tekan_match:
-            return tekan_text  # Remove "Call flow M" part
+            return tekan_text 
         return match.group(0)
 
-    # Now replace "Call flow M" inside Tekan lines with empty string
     processed_text = tekan_redirect_pattern.sub(replace_redirect, text)
 
     # ── First pass: detect multi-item sub-questions ──────────────────────
@@ -355,53 +280,55 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
     flow_to_question: Dict[int, str] = {}
     flow_value_mapping: Dict[str, str] = {}
 
-    # Build flow graph from ORIGINAL text (before preprocessing strips redirects)
     flow_graph = _build_flow_graph(
-        text, processed_text, cf_matches, tekan_untuk_pattern, tekan_range_pattern
+        text, processed_text, cf_matches, tekan_untuk_pattern_loose, tekan_range_pattern
     )
+
+    last_seen_q = ""
 
     for idx, cf_match in enumerate(cf_matches):
         flow_num = int(cf_match.group(1))
         cf_end = cf_match.end()
 
-        # Content BEFORE this "Call flow N" (from previous flow's end)
         if idx > 0:
             content_before = processed_text[cf_matches[idx - 1].end():cf_match.start()]
         else:
             content_before = processed_text[:cf_match.start()]
 
-        # Content AFTER this "Call flow N" (until next "Call flow N")
         if idx + 1 < len(cf_matches):
             content_after = processed_text[cf_end:cf_matches[idx + 1].start()]
         else:
             content_after = processed_text[cf_end:]
 
         # ── Extract question text ──────────────────────────────────────
-        if flow_num in multi_item_questions:
-            question_text = multi_item_questions[flow_num]
-        else:
-            question_text = _extract_question_from_content(
-                content_before, content_after,
-                tekan_untuk_pattern, tekan_range_pattern, skip_patterns
-            )
+        q = _extract_question_from_content(
+            content_before, content_after,
+            tekan_untuk_pattern_strict, tekan_range_pattern, skip_patterns
+        )
 
-        if question_text and flow_num >= 2:
-            flow_to_question[flow_num] = question_text
+        # Context pairing for Likert matrices (e.g. Bomba, Polis)
+        if flow_num in multi_item_questions:
+            if q:
+                last_seen_q = q
+            if last_seen_q:
+                flow_to_question[flow_num] = f"{last_seen_q} [{multi_item_questions[flow_num]}]"
+            else:
+                flow_to_question[flow_num] = multi_item_questions[flow_num]
+        else:
+            if q:
+                last_seen_q = q
+            if q and flow_num >= 2:
+                flow_to_question[flow_num] = q
 
         # ── Extract answer mappings from content_after ─────────────────
         _extract_answers_from_content(
             content_after, flow_num,
-            tekan_untuk_pattern, tekan_range_pattern,
+            tekan_untuk_pattern_strict, tekan_range_pattern,
             flow_value_mapping
         )
 
-    # ── Disambiguate duplicate question texts ────────────────────────────
     flow_to_question = _disambiguate_questions(flow_to_question)
-
-    # ── Identify branch groups ───────────────────────────────────────────
-    branch_groups = _identify_branch_groups(
-        flow_graph, flow_to_question, flow_value_mapping
-    )
+    branch_groups = _identify_branch_groups(flow_graph, flow_to_question, flow_value_mapping)
 
     return flow_to_question, flow_value_mapping, flow_graph, branch_groups
 
@@ -409,12 +336,11 @@ def parse_ivr_script(file_bytes: bytes, filename: str) -> Tuple[
 def _extract_question_from_content(
     content_before: str,
     content_after: str,
-    tekan_untuk_pattern,
+    tekan_untuk_pattern_strict,
     tekan_range_pattern,
     skip_patterns: List[str]
 ) -> str:
     """Extract question text from content before and after a 'Call flow N' marker."""
-
     before_lines = content_before.strip().split('\n')
     question_parts = []
 
@@ -423,24 +349,16 @@ def _extract_question_from_content(
         if not line_stripped:
             continue
 
-        # Skip greeting/intro/instruction lines
         line_lower = line_stripped.lower()
         if any(skip in line_lower for skip in skip_patterns):
             continue
-
-        # Skip lines that look like instructions (Q2 OPTION 2, Q3,Q4,Q5, etc.)
         if re.match(r'^Q\d+', line_stripped, re.IGNORECASE):
             continue
-
-        # Skip "Tekan N untuk X" lines (answers for the PREVIOUS flow)
-        if tekan_untuk_pattern.search(line_stripped):
+        if tekan_untuk_pattern_strict.search(line_stripped):
             continue
-
-        # Skip "Tekan N hingga M" lines (range descriptions)
         if tekan_range_pattern.search(line_stripped):
             continue
 
-        # Clean stray characters from line starts
         line_stripped = re.sub(r'^[\]\[\)\(}{\s]+', '', line_stripped).strip()
         if not line_stripped:
             continue
@@ -449,8 +367,6 @@ def _extract_question_from_content(
 
     question_text = " ".join(question_parts).strip()
 
-    # Also check for trailing question text AFTER "Call flow N" but BEFORE
-    # the first "Tekan" answer line
     after_lines = content_after.strip().split('\n')
     trailing_question = []
 
@@ -458,18 +374,18 @@ def _extract_question_from_content(
         line_stripped = line.strip()
         if not line_stripped:
             continue
-        # Stop at first "Tekan N untuk" line
-        if tekan_untuk_pattern.search(line_stripped):
+            
+        if tekan_untuk_pattern_strict.search(line_stripped):
             break
-        # Stop at "Tekan N hingga" range description
         if tekan_range_pattern.search(line_stripped):
             break
-        # Skip greeting/instruction lines
+            
         line_lower = line_stripped.lower()
         if any(skip in line_lower for skip in skip_patterns):
             continue
         if re.match(r'^Q\d+', line_stripped, re.IGNORECASE):
             continue
+            
         trailing_question.append(line_stripped)
 
     if trailing_question:
@@ -485,7 +401,7 @@ def _extract_question_from_content(
 def _extract_answers_from_content(
     content_after: str,
     flow_num: int,
-    tekan_untuk_pattern,
+    tekan_untuk_pattern_strict,
     tekan_range_pattern,
     flow_value_mapping: Dict[str, str]
 ):
@@ -497,16 +413,13 @@ def _extract_answers_from_content(
         if not line_stripped:
             continue
 
-        # Check for "Tekan N hingga M" (range description - not an answer)
         if tekan_range_pattern.search(line_stripped):
             continue
 
-        # Check for "Tekan N untuk X" (answer - may or may not have redirect)
-        tekan_match = tekan_untuk_pattern.search(line_stripped)
+        tekan_match = tekan_untuk_pattern_strict.search(line_stripped)
         if tekan_match:
             choice_num = int(tekan_match.group(1))
             answer_text = tekan_match.group(2).strip()
-            # Remove any trailing "Call flow M" that might remain
             answer_text = re.sub(r'\s*Call\s+flow\s+\d+\s*$', '', answer_text, flags=re.IGNORECASE).strip()
             key = f"FlowNo_{flow_num}={choice_num}"
             flow_value_mapping[key] = answer_text
