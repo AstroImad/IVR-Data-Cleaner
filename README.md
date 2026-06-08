@@ -121,9 +121,8 @@ The slider in Step 4 controls how strictly incomplete responses are removed:
 | **0.5** | Keep respondents with 50%+ of questions answered (lenient) |
 | **0.0** | Keep all respondents (only drop fully empty rows) |
 
-**Note**: 
-- Respondents who answered "Lain-lain" (Others) are automatically redirected to the survey end. With threshold 1.0, these may need manual review if they didn't reach the last question column.
-- Please compare total CR from Call Centre (CC) with the total final output from this apps. Adjust the slider until the total final data is equal with total CR from CC.
+**Note**: Respondents who answered "Lain-lain" (Others) are automatically redirected to the survey end. With threshold 1.0, these may need manual review if they didn't reach the last question column.
+Please compare total CR from Call Centre (CC) with the total final output from this apps. Adjust the slider until the total final data is equal with total CR from CC.
 
 ## Dependencies
 
