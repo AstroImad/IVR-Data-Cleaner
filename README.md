@@ -5,13 +5,14 @@ A Streamlit web application that cleans and processes Interactive Voice Response
 ## Features
 
 - **Multiple data input methods**: Upload ZIP file, individual CSVs, or paste Google Drive links
-- **Script parsing**: Automatically extracts questions and answer mappings from PDF/DOCX IVR scripts
-- **Multi-layer branching support**: Handles complex IVR flows with skip logic, redirects, and mutually exclusive paths
-- **Column merging**: Automatically merges columns with the same core question (e.g., "Di parlimen manakah anda?" across different flows)
-- **Auto-detect screening flows**: Identifies and filters screening questions (e.g., "Are you a voter?" → Ya/Tidak)
-- **Incomplete response removal**: Uses "Soalan terakhir" (last question) as completion indicator
-- **Inline editing**: Fix unmapped values and edit question/answer mappings directly in the app
-- **Excel export**: Exports cleaned data with separate sheets for main survey and skipped respondents
+- **Advanced Script Parsing**: Automatically extracts questions and answer mappings from PDF/DOCX scripts, featuring strict regex boundaries to prevent misclassification of embedded question text.
+- **Likert Matrix Support**: Intelligently pairs overarching contextual questions with individual sub-items (e.g., "Sila tekan 1 untuk berpuas hati... [Polis]").
+- **Multi-layer branching support**: Handles complex IVR flows with skip logic, redirects, and mutually exclusive paths by unpivoting positional data into dedicated flow columns.
+- **Column merging**: Automatically merges columns with the same core question (e.g., "Di parlimen manakah anda?" across different flows) into a single cohesive column.
+- **Interactive Skip Logic UI**: Features a hybrid auto-detect and human-in-the-loop dropdown to isolate respondents screened out early (e.g., "Are you a voter?" → Ya/Tidak).
+- **Incomplete response removal**: Uses "Soalan terakhir" (last question) as completion indicator while respecting branch-specific nulls.
+- **Inline editing**: Fix unmapped values and edit question/answer mappings directly in the app.
+- **Excel export**: Exports cleaned data with separate sheets for main survey and skipped respondents.
 
 ## How It Works
 
@@ -26,17 +27,18 @@ Upload the IVR call script document (PDF or DOCX). The app parses:
 - Questions associated with each call flow
 - Answer choices ("Tekan N untuk ...")
 - Routing information ("Tekan X untuk Y Call flow M")
+- Multi-item Likert blocks and their overarching context instructions.
 
 You can edit parsed questions and answer mappings before proceeding.
 
 ### Step 3: Rename & Map Columns
 The app automatically:
-- Detects which data columns map to which flow numbers
-- Renames columns to question text from the script
-- Maps `FlowNo_X=Y` values to readable answer text
-- Merges columns with the same core question (strips "Soalan N." prefixes)
-- Detects and filters screening/skip logic flows
-- Allows inline fixing of any unmapped values
+- Isolates and separates screening flows (Skip Logic) using a smart auto-detect algorithm, with a manual override dropdown for edge cases.
+- Extracts positional column data into strict `FlowNo_X` columns to prevent data overwriting.
+- Renames columns to the core question text from the script (stripping "Soalan N." prefixes).
+- Maps `FlowNo_X=Y` values to readable answer text.
+- Merges parallel branch columns into single variables.
+- Allows inline fixing of any unmapped stray values.
 
 ### Step 4: Sanity Check & Export
 - View data summary, column details, and value counts
@@ -54,7 +56,7 @@ The app automatically:
 
 ```bash
 # Clone the repository
-git clone https://github.com/AstroImad/IVR-Data-Cleaner.git
+git clone [https://github.com/AstroImad/IVR-Data-Cleaner.git](https://github.com/AstroImad/IVR-Data-Cleaner.git)
 cd IVR-Data-Cleaner
 
 # Create virtual environment
@@ -66,7 +68,6 @@ pip install -r requirements.txt
 
 # Run the app
 streamlit run app.py
-```
 
 The app will open at `http://localhost:8501`.
 
@@ -101,7 +102,7 @@ Tekan 2 untuk Sri Gading, Batu Pahat... Call flow 5
 Tekan 6 untuk Lain-lain. Call flow 24
 ```
 
-### Multi-item Sub-questions (e.g., Hulu Selangor)
+### Multi-item Sub-questions & Likert Scales (e.g., Hulu Selangor)
 ```
 Soalan ketiga, Saya akan senaraikan beberapa pihak berkuasa.
 Bomba                         tekan 1 hingga 3 Call flow 5
@@ -120,7 +121,9 @@ The slider in Step 4 controls how strictly incomplete responses are removed:
 | **0.5** | Keep respondents with 50%+ of questions answered (lenient) |
 | **0.0** | Keep all respondents (only drop fully empty rows) |
 
-**Note**: Respondents who answered "Lain-lain" (Others) are automatically redirected to the survey end. With threshold 1.0, these may need manual review if they didn't reach the last question column.
+**Note**: 
+- Respondents who answered "Lain-lain" (Others) are automatically redirected to the survey end. With threshold 1.0, these may need manual review if they didn't reach the last question column.
+- Please compare total CR from Call Centre (CC) with the total final output from this apps. Adjust the slider until the total final data is equal with total CR from CC.
 
 ## Dependencies
 
