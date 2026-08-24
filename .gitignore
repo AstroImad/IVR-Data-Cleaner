@@ -5,3 +5,6 @@ __pycache__/
 *.xlsx
 references/
 .venv
+.pdf
+.csv
+.docs
