@@ -13,11 +13,13 @@ import re
 import io
 import zipfile
 import tempfile
-import requests
 import gdown
 import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict, Tuple
+
+FLOW_VALUE_PATTERN = re.compile(r'^FlowNo_(\d+)=(\d+)$')
+NULL_LIKE_VALUES = {'', 'nan', 'none', 'null', 'nat', 'n/a', 'na', 'undefined', '<na>'}
 
 
 def extract_gdrive_folder_id(folder_url: str) -> str:
@@ -78,49 +80,31 @@ def load_csv_from_gdrive_links(text_input: str) -> Tuple[pd.DataFrame, int]:
 
 
 def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[pd.DataFrame]:
-    """Load a CSV file into a pandas DataFrame applying IVR cleaning specifics."""
+    """Load a vendor IVR report; row 1 is a title and row 2 is the header."""
     try:
-        if isinstance(file_path_or_bytes, bytes):
-            f = io.StringIO(file_path_or_bytes.decode('utf-8', errors='replace'))
-        else:
-            f = open(file_path_or_bytes, 'r')
-
-        df = pd.read_csv(f, skiprows=1, names=range(50), engine='python')
-
-        if not isinstance(file_path_or_bytes, bytes):
-            f.close()
-
-        df.dropna(axis='columns', how='all', inplace=True)
-        df.columns = df.iloc[0]
-
-        if 'PhoneNo' not in df.columns:
-            print(f"Warning: No 'PhoneNo' column found in {source_name}")
-            return None
-        phonenum = df[['PhoneNo']]
-
-        if 'UserKeyPress' not in df.columns:
-            print(f"Warning: No 'UserKeyPress' column found in {source_name}")
-            return None
-
-        keypress = df.loc[:, 'UserKeyPress':]
-        raw_results = pd.concat([phonenum, keypress], axis='columns')
-
-        question_cols = [c for c in raw_results.columns if c != 'PhoneNo']
-        raw_results = raw_results.dropna(subset=question_cols, how='all')
-        raw_results = raw_results.astype(str)
-
-        raw_results = raw_results.apply(
-            lambda x: x.str.replace(r'FlowNo_\d{1,}=$', '', regex=True)
+        source = (
+            io.StringIO(file_path_or_bytes.decode("utf-8-sig"))
+            if isinstance(file_path_or_bytes, bytes)
+            else file_path_or_bytes
         )
+        df = pd.read_csv(source, skiprows=1, header=0, dtype="string", engine="python")
+        df.dropna(axis="columns", how="all", inplace=True)
+        missing = {"PhoneNo", "UserKeyPress"}.difference(df.columns)
+        if missing:
+            raise ValueError(f"Missing required column(s): {', '.join(sorted(missing))}")
 
-        new_columns = ['phonenum'] + list(range(len(raw_results.columns) - 1))
-        raw_results.columns = new_columns
-
-        return raw_results
-
-    except Exception as e:
-        print(f"Error loading file {source_name}: {str(e)}")
-        return None
+        first_answer_col = df.columns.get_loc("UserKeyPress")
+        result = pd.concat(
+            [df["PhoneNo"].rename("phonenum"), df.iloc[:, first_answer_col:]],
+            axis="columns",
+        )
+        result.replace(r"^\s*FlowNo_\d+=\s*$", pd.NA, regex=True, inplace=True)
+        result.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
+        result["phonenum"] = result["phonenum"].str.strip()
+        result.columns = ["phonenum"] + list(range(len(result.columns) - 1))
+        return result.reset_index(drop=True)
+    except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
+        raise ValueError(f"Could not load {source_name}: {exc}") from exc
 
 
 def download_gdrive_file(file_id: str, filename: str) -> Optional[bytes]:
@@ -368,13 +352,109 @@ def _classify_columns(
     return common_cols, branch_specific_list, branch_core_questions
 
 
-def apply_flow_value_mapping(
-    df: pd.DataFrame,
-    flow_value_mapping: Dict[str, str]
-) -> pd.DataFrame:
-    """Replace FlowNo_X=Y values with actual answer text throughout the DataFrame."""
-    df_mapped = df.replace(flow_value_mapping)
-    return df_mapped
+def _decode_flow_value(value, mapping: Dict[str, str]):
+    """Decode an exact answer or valid concatenated multi-select keypresses.
+
+    Values containing an answer code that is not present in the parsed script
+    are returned unchanged so invalid respondent data remains visible for
+    validation and correction instead of being silently discarded.
+    """
+    if not isinstance(value, str):
+        return value
+    value = value.strip()
+    if value in mapping:
+        return mapping[value]
+
+    match = FLOW_VALUE_PATTERN.fullmatch(value)
+    if not match:
+        return value
+    flow_num, encoded_choices = match.groups()
+    options = {
+        key.rsplit("=", 1)[1]: answer
+        for key, answer in mapping.items()
+        if key.startswith(f"FlowNo_{flow_num}=")
+    }
+    if len(encoded_choices) > 1 and all(choice in options for choice in encoded_choices):
+        return "; ".join(options[choice] for choice in encoded_choices)
+    return value
+
+
+def apply_flow_value_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """Map exact and concatenated multi-select IVR responses."""
+    return df.apply(lambda column: column.map(lambda value: _decode_flow_value(value, mapping)))
+
+
+def validate_flow_values(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """Compare observed encoded responses with the parsed script codebook."""
+    observed: Dict[Tuple[int, str], int] = {}
+    for column in df.columns:
+        if column in {"phonenum", "Mode"}:
+            continue
+        for value, count in df[column].dropna().astype(str).str.strip().value_counts().items():
+            match = FLOW_VALUE_PATTERN.fullmatch(value)
+            if match:
+                key = (int(match.group(1)), match.group(2))
+                observed[key] = observed.get(key, 0) + int(count)
+
+    records = []
+    for (flow_num, encoded), count in sorted(observed.items()):
+        raw_value = f"FlowNo_{flow_num}={encoded}"
+        decoded = _decode_flow_value(raw_value, mapping)
+        status = (
+            "Mapped" if raw_value in mapping
+            else "Multi-select decoded" if decoded != raw_value
+            else "Unmapped"
+        )
+        records.append({
+            "Flow": flow_num,
+            "Raw Value": raw_value,
+            "Mapped Value": decoded if decoded != raw_value else "",
+            "Count": count,
+            "Status": status,
+        })
+    return pd.DataFrame(
+        records,
+        columns=["Flow", "Raw Value", "Mapped Value", "Count", "Status"],
+    )
+
+
+def _core_question_text(question: str) -> str:
+    core = re.sub(
+        r"^Soalan\s+\w+(\s+\w+)*[\.,]\s*",
+        "",
+        question,
+        flags=re.IGNORECASE,
+    ).strip()
+    return core or question.strip()
+
+
+def classify_responses(df: pd.DataFrame, flow_to_question: Dict[int, str]) -> pd.Series:
+    """Classify call attempts as Complete, Partial, or No response."""
+    question_cols = [column for column in df.columns if column not in {"phonenum", "Mode"}]
+    has_any = (
+        df[question_cols].notna().any(axis=1)
+        if question_cols
+        else pd.Series(False, index=df.index)
+    )
+    final_flows = [
+        flow_num
+        for flow_num, question in flow_to_question.items()
+        if re.search(r"\bsoalan\s+terakhir\b|\blast\s+question\b", question, re.IGNORECASE)
+    ]
+    final_column = (
+        _core_question_text(flow_to_question[max(final_flows)])
+        if final_flows
+        else None
+    )
+    has_final = (
+        df[final_column].notna()
+        if final_column in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    status = pd.Series("Partial", index=df.index, dtype="string")
+    status.loc[~has_any] = "No response"
+    status.loc[has_final] = "Complete"
+    return status
 
 
 def detect_screening_flows(df: pd.DataFrame) -> List[Dict]:
@@ -424,28 +504,34 @@ def detect_screening_flows(df: pd.DataFrame) -> List[Dict]:
     return screening_flows
 
 
-def filter_skip_logic(df: pd.DataFrame, skip_flow_no: str = "FlowNo_2=2") -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Handle IVR skip logic by splitting data into main and skipped dataframes."""
-    skip_flow_no = skip_flow_no.strip()
-    skip_col = None
+def filter_skip_logic(df: pd.DataFrame, skip_flow_no) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split rows matching one or more encoded skip values.
 
-    for col in df.columns:
-        if col == 'phonenum':
-            continue
-        col_values = df[col].astype(str).str.strip()
-        if (col_values == skip_flow_no).any():
-            skip_col = col
-            break
+    Cells may contain a single ``FlowNo_X=Y`` value or a comma/semicolon/
+    pipe-separated multi-select response.  Matching tokens rather than using
+    exact cell equality allows several terminating answers to be filtered in a
+    single operation.
+    """
+    columns = [column for column in df.columns if column not in {"phonenum", "Mode"}]
+    if not columns:
+        return df.copy(), pd.DataFrame(columns=df.columns)
+    values = skip_flow_no if isinstance(skip_flow_no, (list, tuple, set)) else [skip_flow_no]
+    wanted = {str(value).strip() for value in values if str(value).strip()}
+    if not wanted:
+        return df.copy(), pd.DataFrame(columns=df.columns)
 
-    if skip_col is None:
-        return df, pd.DataFrame()
+    def contains_skip_value(value) -> bool:
+        if pd.isna(value):
+            return False
+        tokens = {
+            token.strip()
+            for token in re.split(r"\s*[,;|/]\s*", str(value))
+            if token.strip()
+        }
+        return bool(tokens & wanted)
 
-    col_values = df[skip_col].astype(str).str.strip()
-    skipped_mask = col_values == skip_flow_no
-    main_df = df[~skipped_mask].copy()
-    skipped_df = df[skipped_mask].copy()
-
-    return main_df, skipped_df
+    mask = df[columns].apply(lambda column: column.map(contains_skip_value)).any(axis=1)
+    return df.loc[~mask].copy(), df.loc[mask].copy()
 
 
 def auto_filter_screening(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict]]:
@@ -495,6 +581,7 @@ def clean_data(
 
     # Step 2: Identify question columns (all except phonenum and Mode)
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
+    has_any_answer = df_clean[question_cols].notna().any(axis=1) if question_cols else pd.Series(False, index=df_clean.index)
 
     # Step 3: Aggressive second pass - catch ANY remaining null-like values.
     flow_pattern = re.compile(r'^FlowNo_\d+=\d+$')
@@ -507,8 +594,6 @@ def clean_data(
             s = x.strip()
             if s == '' or s.lower() in {'nan', 'none', 'null', 'nat', 'n/a', 'na', '<na>'}:
                 return np.nan
-            if _pat.match(s):
-                return np.nan
             return x
         df_clean[col] = df_clean[col].apply(_to_nan)
 
@@ -517,8 +602,9 @@ def clean_data(
     for col in df_clean.columns:
         if col in ['phonenum', 'Mode']:
             continue
-        # Drop columns that are still numeric or start with 'FlowNo_' (unmapped)
-        if isinstance(col, (int, float)) or (isinstance(col, str) and col.startswith("FlowNo_")):
+        # Positional columns are redundant after flow extraction. Keep named
+        # FlowNo columns so unmapped values remain visible for correction.
+        if isinstance(col, (int, float)):
             cols_to_drop.append(col)
             continue
         # Drop columns that are entirely NaN
@@ -538,8 +624,7 @@ def clean_data(
         common_cols_list, branch_specific_cols, branch_col_groups = _classify_columns(
             df_clean, branch_groups, flow_to_question
         )
-        if common_cols_list:
-            common_cols = common_cols_list
+        common_cols = common_cols_list
 
     # Step 5: Find the "last question" column for completion detection
     last_q_col = None
@@ -567,9 +652,9 @@ def clean_data(
             else:
                 total_completeness = common_non_null / len(common_cols) if len(common_cols) > 0 else pd.Series(1.0, index=df_clean.index)
 
-            keep_mask = has_last_q | (total_completeness >= completeness_threshold)
+            keep_mask = has_any_answer & (has_last_q | (total_completeness >= completeness_threshold))
         else:
-            keep_mask = has_last_q
+            keep_mask = has_any_answer & has_last_q
 
         before_count = len(df_clean)
         df_clean = df_clean[keep_mask]
@@ -591,7 +676,7 @@ def clean_data(
         else:
             total_completeness = common_non_null / len(common_cols) if len(common_cols) > 0 else pd.Series(1.0, index=df_clean.index)
 
-        df_clean = df_clean[total_completeness >= completeness_threshold]
+        df_clean = df_clean[has_any_answer & (total_completeness >= completeness_threshold)]
 
     # Step 7: Remove duplicate phone numbers
     if 'phonenum' in df_clean.columns:
