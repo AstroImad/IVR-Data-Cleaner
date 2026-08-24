@@ -11,8 +11,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import re
+import io
 from parsers import parse_ivr_script, get_skip_logic_candidates
-from export_utils import normalize_column_labels, to_excel
 from cleaning import (
     load_all_csvs_from_folder,
     load_all_csvs_from_bytes,
@@ -88,6 +88,41 @@ def reset_from_step(step: int):
     if step <= 4:
         st.session_state.cleaned_df = None
     st.session_state.step = step
+
+
+def _excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Prevent text values from being interpreted as spreadsheet formulas."""
+    safe = df.copy()
+    for column in safe.select_dtypes(include=["object", "string"]).columns:
+        safe[column] = safe[column].map(
+            lambda value: f"'{value}"
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@"))
+            else value
+        )
+    return safe
+
+
+def to_excel(
+    completed_df: pd.DataFrame,
+    partial_df: pd.DataFrame = None,
+    no_response_df: pd.DataFrame = None,
+    skipped_df: pd.DataFrame = None,
+    skipped_label: str = "Skipped",
+    validation_df: pd.DataFrame = None,
+) -> bytes:
+    """Create a workbook separated by response status."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        _excel_safe(completed_df).to_excel(writer, index=False, sheet_name="Completed Responses")
+        for frame, sheet_name in (
+            (partial_df, "Partial Responses"),
+            (no_response_df, "No IVR Response"),
+            (skipped_df, skipped_label[:31]),
+            (validation_df, "Data Quality Issues"),
+        ):
+            if frame is not None and not frame.empty:
+                _excel_safe(frame).to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
 
 
 # ─── Sidebar: Progress ────────────────────────────────────────────────────────
@@ -209,7 +244,7 @@ if st.session_state.step == 1:
         col2.metric("Total Columns", st.session_state.raw_df.shape[1])
         col3.metric("Files Loaded", st.session_state.num_files)
         
-        st.dataframe(normalize_column_labels(st.session_state.raw_df.head(20)), width="stretch")
+        st.dataframe(st.session_state.raw_df.head(20), use_container_width=True)
         
         st.subheader("📋 Columns")
         st.write(f"**Columns:** {list(st.session_state.raw_df.columns)}")
@@ -415,7 +450,7 @@ elif st.session_state.step == 3:
                 })
         
         mapping_df = pd.DataFrame(mapping_data)
-        st.dataframe(mapping_df, width="stretch")
+        st.dataframe(mapping_df, use_container_width=True)
         
         # Check for unmatched flows
         unmatched_flows = [
@@ -547,7 +582,7 @@ elif st.session_state.step == 3:
     if validation_df.empty:
         st.info("No encoded IVR responses were found.")
     else:
-        st.dataframe(validation_df, width="stretch", hide_index=True)
+        st.dataframe(validation_df, use_container_width=True, hide_index=True)
         if (validation_df["Status"] == "Unmapped").any():
             st.warning("Unmapped values remain visible and are not silently converted to missing data.")
 
@@ -575,7 +610,7 @@ elif st.session_state.step == 3:
         col1.metric("Rows", f"{st.session_state.mapped_df.shape[0]:,}")
         col2.metric("Columns", st.session_state.mapped_df.shape[1])
 
-        st.dataframe(normalize_column_labels(st.session_state.mapped_df.head(20)), width="stretch")
+        st.dataframe(st.session_state.mapped_df.head(20), use_container_width=True)
 
         st.subheader("📋 Renamed Columns")
         for i, col in enumerate(st.session_state.mapped_df.columns):
@@ -689,17 +724,12 @@ elif st.session_state.step == 4:
         partial_source = st.session_state.mapped_df.loc[response_status == "Partial"].copy()
         no_response_df = st.session_state.mapped_df.loc[response_status == "No response"].copy()
         with st.spinner("Cleaning completed responses..."):
-            try:
-                df = clean_data(
-                    completed_source,
-                    completeness_threshold=0.0,
-                    branch_groups=branch_groups,
-                    flow_to_question=flow_to_question,
-                )
-            except Exception as exc:
-                st.error("The final data-cleaning step failed. Your source data was not changed.")
-                st.exception(exc)
-                st.stop()
+            df = clean_data(
+                completed_source,
+                completeness_threshold=0.0,
+                branch_groups=branch_groups,
+                flow_to_question=flow_to_question,
+            )
         st.session_state.cleaned_df = df
         
         # ─── Summary Stats ─────────────────────────────────────────────────
@@ -713,7 +743,7 @@ elif st.session_state.step == 4:
         
         # ─── Data Preview ──────────────────────────────────────────────────
         st.subheader("👀 Data Preview")
-        st.dataframe(normalize_column_labels(df.head(50)), width="stretch")
+        st.dataframe(df.head(50), use_container_width=True)
         
         # ─── Column Info ───────────────────────────────────────────────────
         st.subheader("📋 Column Details")
@@ -721,7 +751,7 @@ elif st.session_state.step == 4:
         col_info = []
         for col in df.columns:
             col_info.append({
-                "Column": str(col)[:60] + "..." if len(str(col)) > 60 else str(col),
+                "Column": col[:60] + "..." if len(str(col)) > 60 else str(col),
                 "Non-Null": df[col].notna().sum(),
                 "Null": df[col].isna().sum(),
                 "Null %": f"{df[col].isna().mean()*100:.1f}%",
@@ -729,7 +759,7 @@ elif st.session_state.step == 4:
             })
         
         col_info_df = pd.DataFrame(col_info)
-        st.dataframe(col_info_df, width="stretch", hide_index=True)
+        st.dataframe(col_info_df, use_container_width=True, hide_index=True)
         
         # ─── Value Counts ──────────────────────────────────────────────────
         st.subheader("📈 Value Counts per Column")
@@ -737,12 +767,11 @@ elif st.session_state.step == 4:
         for col in df.columns:
             if col in ['phonenum']:
                 continue
-            column_label = str(col)
-            with st.expander(f"📊 {column_label[:80]}"):
+            with st.expander(f"📊 {col[:80]}"):
                 vc = df[col].value_counts(dropna=False).reset_index()
                 vc.columns = ['Value', 'Count']
                 vc['Percentage'] = (vc['Count'] / len(df) * 100).round(1).astype(str) + '%'
-                st.dataframe(vc, width="stretch", hide_index=True)
+                st.dataframe(vc, use_container_width=True, hide_index=True)
         
         # ─── Data Issues ───────────────────────────────────────────────────
         st.subheader("⚠️ Potential Issues")
@@ -758,7 +787,7 @@ elif st.session_state.step == 4:
                     if not issues_found:
                         st.warning("Found unmapped FlowNo values:")
                         issues_found = True
-                    st.write(f"  Column **{str(col)[:50]}**: `{val}`")
+                    st.write(f"  Column **{col[:50]}**: `{val}`")
         
         # Check for high null percentage columns
         for col in df.columns:
@@ -767,7 +796,7 @@ elif st.session_state.step == 4:
                 if not issues_found:
                     st.warning("Columns with high null percentage:")
                     issues_found = True
-                st.write(f"  **{str(col)[:60]}**: {null_pct*100:.1f}% null")
+                st.write(f"  **{col[:60]}**: {null_pct*100:.1f}% null")
         
         if not issues_found:
             st.success("✅ No major issues detected!")
@@ -776,28 +805,23 @@ elif st.session_state.step == 4:
         st.divider()
         st.subheader("📥 Export Data")
         
-        try:
-            partial_df = clean_data(
-                partial_source,
-                completeness_threshold=st.session_state.completeness_threshold,
-                branch_groups=branch_groups,
-                flow_to_question=flow_to_question,
-            )
-            validation_issues = st.session_state.flow_validation
-            if validation_issues is not None:
-                validation_issues = validation_issues[validation_issues["Status"] == "Unmapped"]
-            excel_bytes = to_excel(
-                completed_df=df,
-                partial_df=partial_df,
-                no_response_df=no_response_df,
-                skipped_df=st.session_state.skipped_df,
-                skipped_label=st.session_state.skipped_label,
-                validation_df=validation_issues,
-            )
-        except Exception as exc:
-            st.error("The Excel workbook could not be generated.")
-            st.exception(exc)
-            st.stop()
+        partial_df = clean_data(
+            partial_source,
+            completeness_threshold=st.session_state.completeness_threshold,
+            branch_groups=branch_groups,
+            flow_to_question=flow_to_question,
+        )
+        validation_issues = st.session_state.flow_validation
+        if validation_issues is not None:
+            validation_issues = validation_issues[validation_issues["Status"] == "Unmapped"]
+        excel_bytes = to_excel(
+            completed_df=df,
+            partial_df=partial_df,
+            no_response_df=no_response_df,
+            skipped_df=st.session_state.skipped_df,
+            skipped_label=st.session_state.skipped_label,
+            validation_df=validation_issues,
+        )
 
         st.download_button(
             label="📥 Download as Excel",
