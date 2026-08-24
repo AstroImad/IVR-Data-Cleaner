@@ -353,7 +353,12 @@ def _classify_columns(
 
 
 def _decode_flow_value(value, mapping: Dict[str, str]):
-    """Decode an exact answer or concatenated multi-select keypresses."""
+    """Decode an exact answer or valid concatenated multi-select keypresses.
+
+    Values containing an answer code that is not present in the parsed script
+    are returned unchanged so invalid respondent data remains visible for
+    validation and correction instead of being silently discarded.
+    """
     if not isinstance(value, str):
         return value
     value = value.strip()
