@@ -226,23 +226,7 @@ def apply_column_renames(
     import re
     
     # 1. Extract values into Flow-specific columns
-    # Phone numbers are useful for de-duplication but are not required for
-    # cleaning/export. Preserve them when present and keep a null placeholder
-    # when a source file has no phone-number column.
-    phone_numbers = (
-        df['phonenum']
-        if 'phonenum' in df.columns
-        else pd.Series(pd.NA, index=df.index, dtype=object)
-    )
-    # Phone numbers are useful for de-duplication but are not required for
-    # cleaning/export. Preserve them when present and keep a null placeholder
-    # when a source file has no phone-number column.
-    phone_numbers = (
-        df['phonenum']
-        if 'phonenum' in df.columns
-        else pd.Series(pd.NA, index=df.index, dtype=object)
-    )
-    result = {'phonenum': phone_numbers}
+    result = {'phonenum': df['phonenum']}
     if 'Mode' in df.columns:
         result['Mode'] = df['Mode']
         
