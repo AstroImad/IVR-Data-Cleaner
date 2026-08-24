@@ -5,6 +5,8 @@ import unittest
 
 import pandas as pd
 
+from cleaning import apply_column_renames
+
 from export_utils import normalize_column_labels, to_excel
 
 
@@ -50,6 +52,12 @@ class ExcelExportTests(unittest.TestCase):
             pd.read_excel(io.BytesIO(workbook_bytes)).columns.tolist(),
             ["0"],
         )
+
+    def test_column_mapping_handles_data_without_phonenum(self):
+        frame = pd.DataFrame({0: ["FlowNo_1=1"]})
+        mapped, _ = apply_column_renames(frame, {1: "Question"}, {1: [0]})
+        self.assertIn("phonenum", mapped.columns)
+        self.assertTrue(mapped["phonenum"].isna().all())
 
 
 if __name__ == "__main__":
