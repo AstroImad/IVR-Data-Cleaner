@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
-from parsers import parse_ivr_script
+from parsers import parse_ivr_script, get_skip_logic_candidates
 from cleaning import (
     load_all_csvs_from_folder,
     load_all_csvs_from_bytes,
@@ -22,10 +22,9 @@ from cleaning import (
     apply_column_renames,
     apply_flow_value_mapping,
     filter_skip_logic,
-    auto_filter_screening,
-    detect_screening_flows,
+    validate_flow_values,
+    classify_responses,
     clean_data,
-    get_data_summary,
 )
 
 # ─── Page Config ───────────────────────────────────────────────────────────────
@@ -66,7 +65,9 @@ if 'skipped_df' not in st.session_state:
 if 'skipped_label' not in st.session_state:
     st.session_state.skipped_label = "Skipped"
 if 'completeness_threshold' not in st.session_state:
-    st.session_state.completeness_threshold = 1.0
+    st.session_state.completeness_threshold = 0.8
+if 'flow_validation' not in st.session_state:
+    st.session_state.flow_validation = None
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
 
@@ -89,15 +90,38 @@ def reset_from_step(step: int):
     st.session_state.step = step
 
 
-def to_excel(main_df: pd.DataFrame, skipped_df: pd.DataFrame = None, skipped_label: str = "Skipped") -> bytes:
-    """Convert DataFrame(s) to Excel bytes for download with multiple sheets."""
+def _excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Prevent text values from being interpreted as spreadsheet formulas."""
+    safe = df.copy()
+    for column in safe.select_dtypes(include=["object", "string"]).columns:
+        safe[column] = safe[column].map(
+            lambda value: f"'{value}"
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@"))
+            else value
+        )
+    return safe
+
+
+def to_excel(
+    completed_df: pd.DataFrame,
+    partial_df: pd.DataFrame = None,
+    no_response_df: pd.DataFrame = None,
+    skipped_df: pd.DataFrame = None,
+    skipped_label: str = "Skipped",
+    validation_df: pd.DataFrame = None,
+) -> bytes:
+    """Create a workbook separated by response status."""
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        main_df.to_excel(writer, index=False, sheet_name='Main Survey')
-        if skipped_df is not None and not skipped_df.empty:
-            # Truncate sheet name to 31 chars (Excel limit)
-            sheet_name = skipped_label[:31]
-            skipped_df.to_excel(writer, index=False, sheet_name=sheet_name)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        _excel_safe(completed_df).to_excel(writer, index=False, sheet_name="Completed Responses")
+        for frame, sheet_name in (
+            (partial_df, "Partial Responses"),
+            (no_response_df, "No IVR Response"),
+            (skipped_df, skipped_label[:31]),
+            (validation_df, "Data Quality Issues"),
+        ):
+            if frame is not None and not frame.empty:
+                _excel_safe(frame).to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
 
@@ -350,18 +374,22 @@ elif st.session_state.step == 2:
             )
             
             if st.button("Save Mapping Edits"):
-                new_mapping = {}
-                for line in edited_mapping_text.strip().split('\n'):
+                new_mapping, invalid_lines = {}, []
+                for line in edited_mapping_text.strip().split("\n"):
                     line = line.strip()
-                    if '=' in line:
-                        parts = line.split('=', 1)
-                        key = parts[0].strip()
-                        val = parts[1].strip()
-                        if key and val:
-                            new_mapping[key] = val
-                st.session_state.flow_value_mapping = new_mapping
-                st.success("Answer mappings updated!")
-                st.rerun()
+                    if not line:
+                        continue
+                    match = re.fullmatch(r"(FlowNo_\d+=\d+)\s*=\s*(.+)", line)
+                    if match:
+                        new_mapping[match.group(1)] = match.group(2).strip()
+                    else:
+                        invalid_lines.append(line)
+                if invalid_lines:
+                    st.error("Invalid mapping line(s): " + "; ".join(invalid_lines[:5]))
+                else:
+                    st.session_state.flow_value_mapping = new_mapping
+                    st.success("Answer mappings updated!")
+                    st.rerun()
         
         st.divider()
         
@@ -392,6 +420,10 @@ elif st.session_state.step == 3:
     flow_to_question = st.session_state.flow_to_question
     flow_value_mapping = st.session_state.flow_value_mapping
     branch_groups = st.session_state.branch_groups
+    skip_candidates = get_skip_logic_candidates(
+        st.session_state.flow_graph,
+        flow_to_question,
+    )
     
     # Show detected mappings
     st.subheader("🔍 Detected Column → Flow Mappings")
@@ -465,33 +497,49 @@ elif st.session_state.step == 3:
         )
     )
 
-    # Try auto-detect to set a smart default
-    detected_flows = detect_screening_flows(df)
-    default_skip_val = None
-    if detected_flows:
-        default_skip_val = detected_flows[0]['skip_value']
-    elif "FlowNo_2=2" in all_flowno_vals:
-        default_skip_val = "FlowNo_2=2"
-    elif all_flowno_vals:
-        default_skip_val = all_flowno_vals[0]
-
-    default_idx = 0
-    if default_skip_val in all_flowno_vals:
-        default_idx = all_flowno_vals.index(default_skip_val)
-
     enable_skip_logic = st.checkbox(
-        "Enable Skip Logic Filtering (Separate redirected respondents)",
-        value=True if all_flowno_vals else False,
-        help="Use this to isolate respondents who were screened out early (e.g. Non-voters)."
+        "Enable screening-response filtering",
+        value=False,
+        help="Enable only for an answer that terminates the survey; normal routing answers are not screening answers.",
     )
 
+    candidate_values = {
+        candidate['value']
+        for candidate in skip_candidates
+        if candidate.get('value') in all_flowno_vals
+    }
+    recommended_values = {
+        candidate['value']
+        for candidate in skip_candidates
+        if candidate.get('value') in all_flowno_vals
+        and (candidate.get('terminal') or candidate.get('terminal_reached') or candidate.get('alternate'))
+    }
+    ordered_skip_vals = (
+        sorted(recommended_values, key=lambda value: all_flowno_vals.index(value))
+        + [value for value in all_flowno_vals if value not in recommended_values]
+    )
+
+    if skip_candidates:
+        detected_routes = [candidate for candidate in skip_candidates if candidate.get('value')]
+        if detected_routes:
+            st.caption(
+                f"Detected {len(detected_routes)} routed answer(s); "
+                f"{len(recommended_values)} lead to a terminal or alternate path."
+            )
+        else:
+            st.caption("Detected conditional routes without numeric keypresses; review the script and data together.")
+
     if enable_skip_logic and all_flowno_vals:
-        # Give the user the power to override the algorithm
+        # Give the user the power to override the algorithm, but place routes
+        # that terminate or enter an alternate branch first.
         selected_skip_val = st.selectbox(
-            "Select the answer that triggers the skip/redirect (Auto-detected default applied):",
-            options=all_flowno_vals,
-            index=default_idx,
-            format_func=lambda x: f"{x} → {flow_value_mapping.get(x, 'Unknown')}"
+            "Select the answer that triggers the skip/redirect (detected routes first):",
+            options=ordered_skip_vals,
+            index=0,
+            format_func=lambda x: (
+                f"{x} → {flow_value_mapping.get(x, 'Unknown')}"
+                + (" [terminal/alternate route]" if x in recommended_values else "")
+            )
         )
 
         main_df_raw, skipped_df_raw = filter_skip_logic(df, selected_skip_val)
@@ -527,6 +575,16 @@ elif st.session_state.step == 3:
         st.info("ℹ️ Skip logic filtering disabled. All respondents will be included.")
 
     st.divider()
+
+    st.subheader("Script and Data Validation")
+    validation_df = validate_flow_values(df, flow_value_mapping)
+    st.session_state.flow_validation = validation_df
+    if validation_df.empty:
+        st.info("No encoded IVR responses were found.")
+    else:
+        st.dataframe(validation_df, use_container_width=True, hide_index=True)
+        if (validation_df["Status"] == "Unmapped").any():
+            st.warning("Unmapped values remain visible and are not silently converted to missing data.")
 
     # Apply transformations
     if st.button("🔄 Apply Column Renaming & Flow Mapping", type="primary"):
@@ -661,11 +719,14 @@ elif st.session_state.step == 4:
                     for gq in group_qs:
                         st.markdown(f"  - {gq}")
 
-        # Always recalculate with current threshold
-        with st.spinner("Cleaning data..."):
+        response_status = classify_responses(st.session_state.mapped_df, flow_to_question)
+        completed_source = st.session_state.mapped_df.loc[response_status == "Complete"].copy()
+        partial_source = st.session_state.mapped_df.loc[response_status == "Partial"].copy()
+        no_response_df = st.session_state.mapped_df.loc[response_status == "No response"].copy()
+        with st.spinner("Cleaning completed responses..."):
             df = clean_data(
-                st.session_state.mapped_df,
-                completeness_threshold=st.session_state.completeness_threshold,
+                completed_source,
+                completeness_threshold=0.0,
                 branch_groups=branch_groups,
                 flow_to_question=flow_to_question,
             )
@@ -675,10 +736,10 @@ elif st.session_state.step == 4:
         st.subheader("📊 Data Summary")
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Rows", f"{df.shape[0]:,}")
-        col2.metric("Total Columns", df.shape[1])
-        col3.metric("Respondents", f"{df['phonenum'].nunique():,}")
-        col4.metric("Null Cells", f"{df.isnull().sum().sum():,}")
+        col1.metric("Completed", f"{len(completed_source):,}")
+        col2.metric("Partial", f"{len(partial_source):,}")
+        col3.metric("No IVR Response", f"{len(no_response_df):,}")
+        col4.metric("Exported Completed", f"{len(df):,}")
         
         # ─── Data Preview ──────────────────────────────────────────────────
         st.subheader("👀 Data Preview")
@@ -744,12 +805,24 @@ elif st.session_state.step == 4:
         st.divider()
         st.subheader("📥 Export Data")
         
-        excel_bytes = to_excel(
-            df,
-            st.session_state.skipped_df,
-            st.session_state.skipped_label,
+        partial_df = clean_data(
+            partial_source,
+            completeness_threshold=st.session_state.completeness_threshold,
+            branch_groups=branch_groups,
+            flow_to_question=flow_to_question,
         )
-        
+        validation_issues = st.session_state.flow_validation
+        if validation_issues is not None:
+            validation_issues = validation_issues[validation_issues["Status"] == "Unmapped"]
+        excel_bytes = to_excel(
+            completed_df=df,
+            partial_df=partial_df,
+            no_response_df=no_response_df,
+            skipped_df=st.session_state.skipped_df,
+            skipped_label=st.session_state.skipped_label,
+            validation_df=validation_issues,
+        )
+
         st.download_button(
             label="📥 Download as Excel",
             data=excel_bytes,
