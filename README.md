@@ -39,12 +39,12 @@ You can edit parsed questions and answer mappings before proceeding.
 
 ### Step 3: Rename & Map Columns
 The app automatically:
-- Detects which data columns map to which flow numbers
-- Renames columns to question text from the script
-- Maps `FlowNo_X=Y` values to readable answer text
-- Merges columns with the same core question (strips "Soalan N." prefixes)
-- Detects and filters screening/skip logic flows
-- Allows inline fixing of any unmapped values
+- Isolates and separates screening flows (Skip Logic) using a smart auto-detect algorithm, with a manual override dropdown for edge cases.
+- Extracts positional column data into strict `FlowNo_X` columns to prevent data overwriting.
+- Renames columns to the core question text from the script (stripping "Soalan N." prefixes).
+- Maps `FlowNo_X=Y` values to readable answer text.
+- Merges parallel branch columns into single variables.
+- Allows inline fixing of any unmapped stray values.
 
 ### Step 4: Sanity Check & Export
 - View data summary, column details, and value counts
@@ -62,7 +62,7 @@ The app automatically:
 
 ```bash
 # Clone the repository
-git clone https://github.com/AstroImad/IVR-Data-Cleaner.git
+git clone [https://github.com/AstroImad/IVR-Data-Cleaner.git](https://github.com/AstroImad/IVR-Data-Cleaner.git)
 cd IVR-Data-Cleaner
 
 # Create virtual environment
@@ -75,7 +75,6 @@ pip install -r requirements.txt
 # Run the app
 streamlit run app.py
 ```
-
 The app will open at `http://localhost:8501`.
 
 ## Project Structure
@@ -109,7 +108,7 @@ Tekan 2 untuk Sri Gading, Batu Pahat... Call flow 5
 Tekan 6 untuk Lain-lain. Call flow 24
 ```
 
-### Multi-item Sub-questions (e.g., Hulu Selangor)
+### Multi-item Sub-questions & Likert Scales (e.g., Hulu Selangor)
 ```
 Soalan ketiga, Saya akan senaraikan beberapa pihak berkuasa.
 Bomba                         tekan 1 hingga 3 Call flow 5
