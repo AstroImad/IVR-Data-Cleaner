@@ -7,6 +7,7 @@ A Streamlit web application that cleans and processes Interactive Voice Response
 - **Multiple data input methods**: Upload ZIP file, individual CSVs, or paste Google Drive links
 - **Script parsing**: Automatically extracts questions and answer mappings from PDF/DOCX IVR scripts
 - **Multi-layer branching support**: Handles complex IVR flows with skip logic, redirects, and mutually exclusive paths
+- **Generalized routing detection**: Captures numeric routes, Malay/English navigation phrases, arrows, terminal paths, and routes stored in Word tables
 - **Column merging**: Automatically merges columns with the same core question (e.g., "Di parlimen manakah anda?" across different flows)
 - **Auto-detect screening flows**: Identifies and filters screening questions (e.g., "Are you a voter?" → Ya/Tidak)
 - **Incomplete response removal**: Uses "Soalan terakhir" (last question) as completion indicator
@@ -25,7 +26,14 @@ Upload your IVR CSV files via:
 Upload the IVR call script document (PDF or DOCX). The app parses:
 - Questions associated with each call flow
 - Answer choices ("Tekan N untuk ...")
-- Routing information ("Tekan X untuk Y Call flow M")
+- Routing information in forms such as `Tekan X untuk Y Call flow M`, `Option X -> flow M`, `teruskan ke flow M`, and `go to flow M`
+- Terminal/alternate paths such as `Tamat`, `Terima kasih`, `end survey`, and non-voter branches
+
+The parser exposes every detected route in the script review screen. Routes
+that lead to a terminal flow or look like an alternate/screening branch are
+listed first when skip-logic filtering is enabled. Filtering remains a manual
+confirmation step because a route to another question is not automatically a
+respondent exclusion.
 
 You can edit parsed questions and answer mappings before proceeding.
 
@@ -108,6 +116,17 @@ Bomba                         tekan 1 hingga 3 Call flow 5
 Klinik Kesihatan Kerajaan     tekan 1 hingga 3 Call flow 6
 Majlis Perbandaran (MPHS)     tekan 1 hingga 3 Call flow 7
 ```
+
+### Other routing forms
+```text
+Option 1 -> flow 3
+Answer 2 untuk Tidak, pergi ke Call flow 9
+Tekan 3 untuk Enggan menjawab. Tamat
+```
+
+Matrix declarations such as `Tekan 0 hingga 3` and `Tekan 1 hingga 3` are
+mapped to their corresponding `FlowNo_X=Y` values without being mistaken for
+a single skip route. DOCX paragraphs and table cells are both parsed.
 
 ## Completeness Threshold
 
