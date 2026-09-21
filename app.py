@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import re
 import io
+import xlsxwriter
 from parsers import parse_ivr_script, get_skip_logic_candidates
 from cleaning import (
     load_all_csvs_from_folder,
@@ -68,8 +69,32 @@ if 'completeness_threshold' not in st.session_state:
     st.session_state.completeness_threshold = 0.8
 if 'flow_validation' not in st.session_state:
     st.session_state.flow_validation = None
+if 'excel_bytes' not in st.session_state:
+    st.session_state.excel_bytes = None
+if 'csv_bytes' not in st.session_state:
+    st.session_state.csv_bytes = None
 
 # ─── Helper Functions ──────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _cached_clean_data(df: pd.DataFrame, completeness_threshold: float,
+                        branch_groups: list, flow_to_question: dict) -> pd.DataFrame:
+    """Cached wrapper around clean_data.
+
+    Streamlit reruns the whole script on every widget interaction, so
+    without caching this (and the export step below) it was recomputing the
+    full cleaning pass -- including everything vectorized in cleaning.py --
+    every time the user touched any widget on the page, not just when the
+    inputs actually changed. st.cache_data hashes the inputs and skips the
+    recompute when they're unchanged.
+    """
+    return clean_data(
+        df,
+        completeness_threshold=completeness_threshold,
+        branch_groups=branch_groups,
+        flow_to_question=flow_to_question,
+    )
+
 
 def reset_from_step(step: int):
     """Reset all session state from the given step onwards."""
@@ -87,19 +112,45 @@ def reset_from_step(step: int):
         st.session_state.mapped_df = None
     if step <= 4:
         st.session_state.cleaned_df = None
+        st.session_state.excel_bytes = None
+        st.session_state.csv_bytes = None
     st.session_state.step = step
 
 
 def _excel_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """Prevent text values from being interpreted as spreadsheet formulas."""
+    """Prevent text values from being interpreted as spreadsheet formulas.
+
+    Rewritten from a per-cell `.map(lambda ...)` to vectorized string ops
+    (`str.startswith` + `.where`) so this doesn't add a full Python-level
+    pass over every cell right before export, on top of everything else.
+    """
     safe = df.copy()
     for column in safe.select_dtypes(include=["object", "string"]).columns:
-        safe[column] = safe[column].map(
-            lambda value: f"'{value}"
-            if isinstance(value, str) and value.startswith(("=", "+", "-", "@"))
-            else value
-        )
+        series = safe[column]
+        str_series = series.astype("string")
+        needs_prefix = str_series.str.startswith(("=", "+", "-", "@")).fillna(False)
+        if needs_prefix.any():
+            safe[column] = series.where(~needs_prefix, "'" + str_series)
     return safe
+
+
+def _write_sheet(workbook, sheet_name: str, df: pd.DataFrame) -> None:
+    """Write a DataFrame to a worksheet directly through xlsxwriter, one row
+    at a time in strict sequential order.
+
+    NOTE: pandas' `to_excel(..., engine="xlsxwriter")` does not guarantee
+    writing cells in strict row order internally, and combining that with
+    xlsxwriter's `constant_memory=True` was verified (via a manual
+    round-trip test) to silently drop cells instead of raising an error --
+    a correctness risk, not just a performance one. Writing rows directly
+    with `worksheet.write_row()` avoids that failure mode while still
+    getting the streaming memory behavior.
+    """
+    worksheet = workbook.add_worksheet(sheet_name[:31])
+    worksheet.write_row(0, 0, [str(c) for c in df.columns])
+    for row_idx, row in enumerate(df.itertuples(index=False, name=None), start=1):
+        clean_row = [None if pd.isna(value) else value for value in row]
+        worksheet.write_row(row_idx, 0, clean_row)
 
 
 def to_excel(
@@ -110,19 +161,38 @@ def to_excel(
     skipped_label: str = "Skipped",
     validation_df: pd.DataFrame = None,
 ) -> bytes:
-    """Create a workbook separated by response status."""
+    """Create a workbook separated by response status.
+
+    Writes with xlsxwriter's `constant_memory` mode instead of openpyxl.
+    openpyxl builds the entire workbook as an in-memory object graph before
+    writing, which is a common source of crashes once a sheet has hundreds
+    of thousands of rows; `constant_memory` streams rows to the output
+    buffer as they're written instead of holding them all in memory. See
+    `_write_sheet` for why this bypasses pandas' own `to_excel()` call.
+    """
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        _excel_safe(completed_df).to_excel(writer, index=False, sheet_name="Completed Responses")
-        for frame, sheet_name in (
-            (partial_df, "Partial Responses"),
-            (no_response_df, "No IVR Response"),
-            (skipped_df, skipped_label[:31]),
-            (validation_df, "Data Quality Issues"),
-        ):
-            if frame is not None and not frame.empty:
-                _excel_safe(frame).to_excel(writer, index=False, sheet_name=sheet_name)
+    workbook = xlsxwriter.Workbook(output, {"constant_memory": True, "in_memory": True})
+    _write_sheet(workbook, "Completed Responses", _excel_safe(completed_df))
+    for frame, sheet_name in (
+        (partial_df, "Partial Responses"),
+        (no_response_df, "No IVR Response"),
+        (skipped_df, skipped_label[:31]),
+        (validation_df, "Data Quality Issues"),
+    ):
+        if frame is not None and not frame.empty:
+            _write_sheet(workbook, sheet_name, _excel_safe(frame))
+    workbook.close()
     return output.getvalue()
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Stream a DataFrame to CSV bytes.
+
+    CSV writing is far cheaper than Excel for very large tables (no styling,
+    no workbook object graph, no per-sheet row limit). Offered as a faster
+    alternative export for large datasets alongside the Excel download.
+    """
+    return _excel_safe(df).to_csv(index=False).encode("utf-8-sig")
 
 
 # ─── Sidebar: Progress ────────────────────────────────────────────────────────
@@ -724,11 +794,11 @@ elif st.session_state.step == 4:
         partial_source = st.session_state.mapped_df.loc[response_status == "Partial"].copy()
         no_response_df = st.session_state.mapped_df.loc[response_status == "No response"].copy()
         with st.spinner("Cleaning completed responses..."):
-            df = clean_data(
+            df = _cached_clean_data(
                 completed_source,
-                completeness_threshold=0.0,
-                branch_groups=branch_groups,
-                flow_to_question=flow_to_question,
+                0.0,
+                branch_groups,
+                flow_to_question,
             )
         st.session_state.cleaned_df = df
         
@@ -804,33 +874,64 @@ elif st.session_state.step == 4:
         # ─── Export ────────────────────────────────────────────────────────
         st.divider()
         st.subheader("📥 Export Data")
-        
-        partial_df = clean_data(
-            partial_source,
-            completeness_threshold=st.session_state.completeness_threshold,
-            branch_groups=branch_groups,
-            flow_to_question=flow_to_question,
+
+        st.caption(
+            "Building the export is a heavier step on large datasets, so it only "
+            "runs when you click a button below — not on every page interaction."
         )
+
         validation_issues = st.session_state.flow_validation
         if validation_issues is not None:
             validation_issues = validation_issues[validation_issues["Status"] == "Unmapped"]
-        excel_bytes = to_excel(
-            completed_df=df,
-            partial_df=partial_df,
-            no_response_df=no_response_df,
-            skipped_df=st.session_state.skipped_df,
-            skipped_label=st.session_state.skipped_label,
-            validation_df=validation_issues,
-        )
 
-        st.download_button(
-            label="📥 Download as Excel",
-            data=excel_bytes,
-            file_name="ivr_cleaned.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-        
+        col_gen1, col_gen2 = st.columns(2)
+
+        with col_gen1:
+            if st.button("📊 Generate Excel Export", type="primary"):
+                with st.spinner("Building Excel workbook..."):
+                    partial_df = _cached_clean_data(
+                        partial_source,
+                        st.session_state.completeness_threshold,
+                        branch_groups,
+                        flow_to_question,
+                    )
+                    st.session_state.excel_bytes = to_excel(
+                        completed_df=df,
+                        partial_df=partial_df,
+                        no_response_df=no_response_df,
+                        skipped_df=st.session_state.skipped_df,
+                        skipped_label=st.session_state.skipped_label,
+                        validation_df=validation_issues,
+                    )
+                st.success("Excel file ready — download below.")
+
+        with col_gen2:
+            if st.button("📄 Generate CSV Export (Completed only)"):
+                with st.spinner("Building CSV..."):
+                    st.session_state.csv_bytes = to_csv_bytes(df)
+                st.success("CSV file ready — download below.")
+                st.caption(
+                    "CSV only contains the Completed Responses sheet, but writes "
+                    "much faster than Excel on very large datasets and has no "
+                    "per-sheet row limit."
+                )
+
+        if st.session_state.excel_bytes:
+            st.download_button(
+                label="📥 Download as Excel",
+                data=st.session_state.excel_bytes,
+                file_name="ivr_cleaned.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        if st.session_state.csv_bytes:
+            st.download_button(
+                label="📥 Download as CSV",
+                data=st.session_state.csv_bytes,
+                file_name="ivr_cleaned_completed.csv",
+                mime="text/csv",
+            )
+
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
