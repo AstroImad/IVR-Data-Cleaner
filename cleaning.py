@@ -87,7 +87,7 @@ def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[
             if isinstance(file_path_or_bytes, bytes)
             else file_path_or_bytes
         )
-        df = pd.read_csv(source, skiprows=1, header=0, dtype="string", engine="python")
+        df = pd.read_csv(source, skiprows=1, header=0, dtype="string", engine="c", low_memory=False)
         df.dropna(axis="columns", how="all", inplace=True)
         missing = {"PhoneNo", "UserKeyPress"}.difference(df.columns)
         if missing:
@@ -224,38 +224,54 @@ def apply_column_renames(
     """
     import numpy as np
     import re
-    
-    # 1. Extract values into Flow-specific columns
+
+    # 1. Extract values into Flow-specific columns.
+    #
+    # This used to walk every non-null cell in Python (`df[col].dropna().items()`
+    # + `result_df.at[idx, ...] = ...`), which is O(rows x cols) individual
+    # Python/pandas calls. On large datasets (hundreds of thousands of rows)
+    # that loop is the main reason the app stalls/crashes. The rewrite below
+    # extracts the flow number for every cell with a single vectorized regex
+    # per raw column, then scatters values into the target FlowNo_X columns
+    # with vectorized `.where()` calls -- bounded by (number of raw columns x
+    # number of distinct flow numbers seen per column), not by row count.
+    raw_cols = [c for c in df.columns if c not in ('phonenum', 'Mode')]
+    flow_pattern = re.compile(r'^FlowNo_(\d+)=(\d+)$')
+
+    # Normalize each raw column to stripped strings once, and extract the
+    # flow number (as a string) for every cell in one vectorized regex call.
+    stripped_cols: Dict = {}
+    flow_num_per_cell: Dict = {}
+    for col in raw_cols:
+        stripped = df[col].astype("string").str.strip()
+        stripped_cols[col] = stripped
+        flow_num_per_cell[col] = stripped.str.extract(r'^FlowNo_(\d+)=\d+$', expand=True)[0]
+
+    all_flow_nums = set(flow_to_question.keys())
+    for col in raw_cols:
+        seen = flow_num_per_cell[col].dropna().unique()
+        all_flow_nums.update(int(x) for x in seen)
+
+    flow_series: Dict[int, pd.Series] = {
+        flow_num: pd.Series(pd.NA, index=df.index, dtype=object) for flow_num in all_flow_nums
+    }
+
+    for col in raw_cols:
+        extracted = flow_num_per_cell[col]
+        for flow_str in extracted.dropna().unique():
+            flow_num = int(flow_str)
+            if flow_num not in flow_series:
+                flow_series[flow_num] = pd.Series(pd.NA, index=df.index, dtype=object)
+            mask = (extracted == flow_str).to_numpy(dtype=bool, na_value=False)
+            flow_series[flow_num] = flow_series[flow_num].where(~mask, stripped_cols[col])
+
     result = {'phonenum': df['phonenum']}
     if 'Mode' in df.columns:
         result['Mode'] = df['Mode']
-        
-    flow_pattern = re.compile(r'^FlowNo_(\d+)=(\d+)$')
-    all_flow_nums = set(flow_to_question.keys())
-    
-    # Find all actual flow numbers present in the data
-    for col in df.columns:
-        if col in ['phonenum', 'Mode']: continue
-        for val in df[col].dropna().unique():
-            match = flow_pattern.match(str(val).strip())
-            if match:
-                all_flow_nums.add(int(match.group(1)))
-                
-    # Explicitly set dtype to object so Pandas allows string assignment later
-    for flow_num in all_flow_nums:
-        result[f"FlowNo_{flow_num}"] = pd.Series(np.nan, index=df.index, dtype=object)
-            
+    for flow_num, series in flow_series.items():
+        result[f"FlowNo_{flow_num}"] = series
+
     result_df = pd.DataFrame(result, index=df.index)
-    
-    # Populate the Flow-specific columns
-    for col in df.columns:
-        if col in ['phonenum', 'Mode']: continue
-        for idx, val in df[col].dropna().items():
-            val_str = str(val).strip()
-            match = flow_pattern.match(val_str)
-            if match:
-                flow_num = int(match.group(1))
-                result_df.at[idx, f"FlowNo_{flow_num}"] = val_str
 
     # 2. Build mapping from Flow column to Core Question
     col_to_core = {}
@@ -359,7 +375,7 @@ def _decode_flow_value(value, mapping: Dict[str, str]):
     are returned unchanged so invalid respondent data remains visible for
     validation and correction instead of being silently discarded.
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str):   
         return value
     value = value.strip()
     if value in mapping:
@@ -380,8 +396,43 @@ def _decode_flow_value(value, mapping: Dict[str, str]):
 
 
 def apply_flow_value_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    """Map exact and concatenated multi-select IVR responses."""
-    return df.apply(lambda column: column.map(lambda value: _decode_flow_value(value, mapping)))
+    """Map exact and concatenated multi-select IVR responses.
+
+    The previous implementation called `_decode_flow_value` (a Python
+    function with a regex fullmatch inside) once per cell, i.e. millions of
+    times on a large dataset. Since the decoded result only depends on the
+    *value* (not the row/column it lives in) and the mapping is fixed for
+    the whole call, we only need to run that logic once per distinct value
+    that actually appears in the data, then apply the resulting lookup table
+    with vectorized `Series.map` + `combine_first` calls.
+    """
+    object_cols = [
+        col for col in df.columns
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col])
+    ]
+    if not object_cols:
+        return df.copy()
+
+    unique_values = pd.unique(
+        np.concatenate([df[col].dropna().unique() for col in object_cols])
+        if object_cols else np.array([])
+    )
+
+    translation = {}
+    for value in unique_values:
+        if isinstance(value, str):
+            decoded = _decode_flow_value(value, mapping)
+            if decoded != value:
+                translation[value] = decoded
+
+    result = df.copy()
+    if not translation:
+        return result
+
+    for col in object_cols:
+        mapped = result[col].map(translation)
+        result[col] = mapped.combine_first(result[col])
+    return result
 
 
 def validate_flow_values(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
@@ -520,17 +571,24 @@ def filter_skip_logic(df: pd.DataFrame, skip_flow_no) -> Tuple[pd.DataFrame, pd.
     if not wanted:
         return df.copy(), pd.DataFrame(columns=df.columns)
 
-    def contains_skip_value(value) -> bool:
-        if pd.isna(value):
-            return False
-        tokens = {
-            token.strip()
-            for token in re.split(r"\s*[,;|/]\s*", str(value))
-            if token.strip()
-        }
-        return bool(tokens & wanted)
+    # The previous implementation called a Python function (with a regex
+    # split inside) once per cell across every question column, which is
+    # slow at large row counts. Rewritten as one vectorized regex per column:
+    # each wanted value must appear as a whole token, bounded by a
+    # comma/semicolon/pipe/slash/space separator or the start/end of the
+    # (padded) string -- equivalent to the original token-splitting logic.
+    escaped = sorted((re.escape(value) for value in wanted), key=len, reverse=True)
+    boundary = r'(?:^|[,;|/\s])(?:' + '|'.join(escaped) + r')(?:$|[,;|/\s])'
+    compiled = re.compile(boundary)
 
-    mask = df[columns].apply(lambda column: column.map(contains_skip_value)).any(axis=1)
+    mask = pd.Series(False, index=df.index)
+    for column in columns:
+        series = df[column]
+        if series.dtype != object and not pd.api.types.is_string_dtype(series):
+            continue
+        padded = ' ' + series.astype(str) + ' '
+        mask = mask | padded.str.contains(compiled, regex=True, na=False)
+
     return df.loc[~mask].copy(), df.loc[mask].copy()
 
 
@@ -567,35 +625,38 @@ def clean_data(
     df_clean = df.copy()
 
     # Step 1: Thoroughly replace null-like values with np.nan
+    #
+    # Both null-cleaning passes below used to call a Python lambda once per
+    # cell via `.apply()`. Rewritten to strip/lower-case each column in one
+    # vectorized string operation and build a boolean mask, which pandas
+    # evaluates in C rather than looping in Python -- this matters a lot once
+    # a dataset reaches hundreds of thousands of rows.
     null_like = {'', ' ', '  ', 'nan', 'NaN', 'NAN', 'None', 'none', 'NONE',
                  'null', 'NULL', 'NaT', 'nat', 'N/A', 'n/a', 'NA', 'na',
                  'undefined', 'Nan', '<NA>'}
 
+    def _mask_null_like(series: pd.Series, values: set, lowercase: bool = False) -> pd.Series:
+        """Vectorized replacement for the old per-cell `.apply()` null check."""
+        non_null = series.notna()
+        stripped = series.astype(str).str.strip()
+        if lowercase:
+            stripped = stripped.str.lower()
+        is_null_like = non_null & (stripped.isin(values) | (stripped == ''))
+        return series.mask(is_null_like, np.nan)
+
     for col in df_clean.columns:
-        if col in ['phonenum']:
+        if col == 'phonenum':
             continue
-        df_clean[col] = df_clean[col].apply(
-            lambda x: np.nan if (isinstance(x, str) and x.strip() in null_like) or
-                      (isinstance(x, str) and x.strip() == '') else x
-        )
+        df_clean[col] = _mask_null_like(df_clean[col], null_like)
 
     # Step 2: Identify question columns (all except phonenum and Mode)
     question_cols = [col for col in df_clean.columns if col not in ['phonenum', 'Mode']]
     has_any_answer = df_clean[question_cols].notna().any(axis=1) if question_cols else pd.Series(False, index=df_clean.index)
 
     # Step 3: Aggressive second pass - catch ANY remaining null-like values.
-    flow_pattern = re.compile(r'^FlowNo_\d+=\d+$')
+    second_pass_null_like = {'nan', 'none', 'null', 'nat', 'n/a', 'na', '<na>'}
     for col in question_cols:
-        def _to_nan(x, _pat=flow_pattern):
-            if x is None or (isinstance(x, float) and np.isnan(x)):
-                return np.nan
-            if not isinstance(x, str):
-                return x
-            s = x.strip()
-            if s == '' or s.lower() in {'nan', 'none', 'null', 'nat', 'n/a', 'na', '<na>'}:
-                return np.nan
-            return x
-        df_clean[col] = df_clean[col].apply(_to_nan)
+        df_clean[col] = _mask_null_like(df_clean[col], second_pass_null_like, lowercase=True)
 
     # Step 3.5: Remove unmapped/extra columns.
     cols_to_drop = []
