@@ -7,4 +7,6 @@ references/
 .venv
 .pdf
 .csv
-.docs
+.docx
+
+/example
