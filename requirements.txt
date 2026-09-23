@@ -1,9 +1,7 @@
 streamlit
 pandas
 numpy
-gdown
 pdfplumber
 python-docx
 openpyxl
-requests
 xlsxwriter
