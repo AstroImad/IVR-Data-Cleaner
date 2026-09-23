@@ -11,6 +11,7 @@ Supports generalized IVR skip logic handling:
 import os
 import re
 import io
+import csv
 import zipfile
 import tempfile
 import gdown
@@ -80,30 +81,56 @@ def load_csv_from_gdrive_links(text_input: str) -> Tuple[pd.DataFrame, int]:
 
 
 def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[pd.DataFrame]:
-    """Load a vendor IVR report; row 1 is a title and row 2 is the header."""
-    try:
-        source = (
-            io.StringIO(file_path_or_bytes.decode("utf-8-sig"))
-            if isinstance(file_path_or_bytes, bytes)
-            else file_path_or_bytes
-        )
-        df = pd.read_csv(source, skiprows=1, header=0, dtype="string", engine="c", low_memory=False)
-        df.dropna(axis="columns", how="all", inplace=True)
-        missing = {"PhoneNo", "UserKeyPress"}.difference(df.columns)
-        if missing:
-            raise ValueError(f"Missing required column(s): {', '.join(sorted(missing))}")
+    """Load a vendor IVR report; row 1 is a title and row 2 is the header.
 
-        first_answer_col = df.columns.get_loc("UserKeyPress")
+    Newer reports name only the first eight columns in their header but put
+    later IVR answers in additional, unnamed columns.  The normal read is
+    kept for fixed-width reports; variable-width reports are read again with
+    enough positional columns to retain every answer.
+    """
+    try:
+        if isinstance(file_path_or_bytes, bytes):
+            decoded = file_path_or_bytes.decode("utf-8-sig")
+
+        # Check the full report width before pandas reads it.  If the first
+        # answer row is wider than the header, pandas can silently treat the
+        # leading fields as an index rather than raising ParserError.
+        if isinstance(file_path_or_bytes, bytes):
+            csv_source = io.StringIO(decoded)
+        else:
+            csv_source = open(file_path_or_bytes, encoding="utf-8-sig", newline="")
+        with csv_source:
+            reader = csv.reader(csv_source)
+            next(reader)  # Report title
+            header = next(reader)
+            missing = {"PhoneNo", "UserKeyPress"}.difference(header)
+            if missing:
+                raise ValueError(f"Missing required column(s): {', '.join(sorted(missing))}")
+            phone_col = header.index("PhoneNo")
+            first_answer_col = header.index("UserKeyPress")
+            width = max(len(header), max((len(row) for row in reader), default=0))
+
+        source = io.StringIO(decoded) if isinstance(file_path_or_bytes, bytes) else file_path_or_bytes
+        if width == len(header):
+            df = pd.read_csv(source, skiprows=1, header=0, dtype="string", engine="c", low_memory=False)
+        else:
+            df = pd.read_csv(
+                source, skiprows=2, header=None, names=range(width),
+                dtype="string", engine="c", low_memory=False,
+            )
+
         result = pd.concat(
-            [df["PhoneNo"].rename("phonenum"), df.iloc[:, first_answer_col:]],
+            [df.iloc[:, phone_col].rename("phonenum"), df.iloc[:, first_answer_col:]],
             axis="columns",
         )
         result.replace(r"^\s*FlowNo_\d+=\s*$", pd.NA, regex=True, inplace=True)
         result.replace(r"^\s*$", pd.NA, regex=True, inplace=True)
         result["phonenum"] = result["phonenum"].str.strip()
+        answer_cols = [col for col in result.columns if col != "phonenum" and result[col].notna().any()]
+        result = result.loc[:, ["phonenum"] + answer_cols]
         result.columns = ["phonenum"] + list(range(len(result.columns) - 1))
         return result.reset_index(drop=True)
-    except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as exc:
+    except (UnicodeDecodeError, pd.errors.ParserError, ValueError, StopIteration) as exc:
         raise ValueError(f"Could not load {source_name}: {exc}") from exc
 
 
@@ -164,6 +191,7 @@ def load_csvs_from_zip(zip_bytes: bytes) -> Tuple[pd.DataFrame, int, List[str]]:
     """Load and combine all CSV files from a ZIP archive."""
     dfs = []
     file_names = []
+    failures = []
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
         csv_files = [f for f in zf.namelist() if f.lower().endswith('.csv') and not f.startswith('__MACOSX')]
@@ -179,8 +207,10 @@ def load_csvs_from_zip(zip_bytes: bytes) -> Tuple[pd.DataFrame, int, List[str]]:
                     dfs.append(df)
                     file_names.append(os.path.basename(csv_name))
             except Exception as e:
-                print(f"Error loading {csv_name} from ZIP: {str(e)}")
-                continue
+                failures.append(f"{csv_name}: {e}")
+
+    if failures:
+        raise ValueError("Could not load all CSV files from ZIP: " + "; ".join(failures))
 
     if not dfs:
         raise ValueError("Could not load any CSV files from the ZIP archive.")
