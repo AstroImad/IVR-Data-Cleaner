@@ -1,6 +1,6 @@
 """
 IVR data loading and cleaning logic.
-Handles loading CSV files from Google Drive and cleaning the data.
+Handles uploaded CSV files and ZIP archives.
 
 Supports generalized IVR skip logic handling:
 - Simple skip logic (e.g., Johor: Q6 → different next question)
@@ -13,71 +13,12 @@ import re
 import io
 import csv
 import zipfile
-import tempfile
-import gdown
 import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict, Tuple
 
 FLOW_VALUE_PATTERN = re.compile(r'^FlowNo_(\d+)=(\d+)$')
 NULL_LIKE_VALUES = {'', 'nan', 'none', 'null', 'nat', 'n/a', 'na', 'undefined', '<na>'}
-
-
-def extract_gdrive_folder_id(folder_url: str) -> str:
-    """Extract folder ID from a Google Drive URL."""
-    match = re.search(r'/folders/([a-zA-Z0-9_-]+)', folder_url)
-    if not match:
-        raise ValueError(
-            "Invalid Google Drive folder URL. "
-            "Please provide a shared folder link like: https://drive.google.com/drive/folders/..."
-        )
-    return match.group(1)
-
-
-def extract_gdrive_file_id(url: str) -> Optional[str]:
-    """Extract file ID from a Google Drive file URL."""
-    match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
-    if match: return match.group(1)
-    match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
-    if match: return match.group(1)
-    match = re.search(r'/open\?id=([a-zA-Z0-9_-]+)', url)
-    if match: return match.group(1)
-    return None
-
-
-def download_single_gdrive_file(file_id: str) -> Optional[bytes]:
-    """Download a single file from Google Drive using gdown."""
-    url = f"https://drive.google.com/uc?id={file_id}"
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tmp:
-            tmp_path = tmp.name
-        gdown.download(url, tmp_path, quiet=True)
-        with open(tmp_path, 'rb') as f:
-            content = f.read()
-        os.unlink(tmp_path)
-        return content
-    except Exception as e:
-        print(f"Error downloading file {file_id}: {str(e)}")
-        return None
-
-
-def load_csv_from_gdrive_links(text_input: str) -> Tuple[pd.DataFrame, int]:
-    """Load CSV files from Google Drive file links."""
-    lines = [line.strip() for line in text_input.strip().split('\n') if line.strip()]
-    dfs = []
-    for line in lines:
-        file_id = extract_gdrive_file_id(line)
-        if not file_id:
-            continue
-        file_bytes = download_single_gdrive_file(file_id)
-        if file_bytes:
-            df = load_csv_file(file_bytes, source_name=line)
-            if df is not None:
-                dfs.append(df)
-    if not dfs:
-        raise ValueError("Could not load any CSV files from the provided links.")
-    combined = pd.concat(dfs, ignore_index=True)
-    return combined, len(dfs)
 
 
 def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[pd.DataFrame]:
@@ -132,43 +73,6 @@ def load_csv_file(file_path_or_bytes, source_name: str = "unknown") -> Optional[
         return result.reset_index(drop=True)
     except (UnicodeDecodeError, pd.errors.ParserError, ValueError, StopIteration) as exc:
         raise ValueError(f"Could not load {source_name}: {exc}") from exc
-
-
-def download_gdrive_file(file_id: str, filename: str) -> Optional[bytes]:
-    """Download a single file from Google Drive using gdown."""
-    import tempfile
-    try:
-        url = f"https://drive.google.com/uc?id={file_id}"
-        with tempfile.NamedTemporaryFile(suffix='.csv', delete=True) as tmp:
-            gdown.download(url, tmp.name, quiet=True)
-            with open(tmp.name, 'rb') as f:
-                return f.read()
-    except Exception as e:
-        print(f"Error downloading {filename} (ID: {file_id}): {str(e)}")
-        return None
-
-
-def load_all_csvs_from_folder(folder_url: str) -> Tuple[pd.DataFrame, int]:
-    """Load and combine all CSV files from a Google Drive shared folder."""
-    try:
-        files = list_gdrive_folder_files(folder_url)
-    except Exception as e:
-        raise ValueError(f"Could not access Google Drive folder: {str(e)}")
-
-    if not files:
-        raise ValueError("No CSV files found in the Google Drive folder.")
-
-    dfs = []
-    for file_info in files:
-        df = load_csv_file(file_info['path'], source_name=file_info['name'])
-        if df is not None:
-            dfs.append(df)
-
-    if not dfs:
-        raise ValueError("Could not load any CSV files from the folder.")
-
-    combined = pd.concat(dfs, ignore_index=True)
-    return combined, len(dfs)
 
 
 def load_all_csvs_from_bytes(file_list: list) -> pd.DataFrame:
